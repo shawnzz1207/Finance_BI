@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
 import pandas as pd
 
 from finance_bi.data_pipeline import (
@@ -7,11 +11,13 @@ from finance_bi.data_pipeline import (
     aggregate_pnl,
     apply_filters,
     available_dimension_values,
+    build_category_grade_breakdown,
     build_monthly_metric_analysis,
     build_monthly_full_metrics,
     build_overview_monthly_detail,
     build_multi_metric_yoy_comparison,
     build_spu_benchmarks,
+    load_finance_data_with_defaults,
 )
 from finance_bi.ui import chinese_headers, display_table
 
@@ -266,3 +272,63 @@ def test_multi_metric_yoy_comparison_uses_one_row_per_spu_and_shared_status() ->
     assert result["状态"].to_dict() == {"SPU-1": "存量", "SPU-2": "新增", "SPU-3": "退出"}
     assert abs(result.loc["SPU-1", "销售额同比"] - 0.20) < 1e-12
     assert abs(result.loc["SPU-1", "采购成本占比同比变化"] - 0.05) < 1e-12
+
+
+def test_category_grade_breakdown_respects_category_and_subcategory_grain() -> None:
+    rows = []
+    for spu, category, subcategory, grade, sales in [
+        ("SPU-1", "户外", "餐桌", "A", 300.0),
+        ("SPU-2", "户外", "摇椅", "B", 200.0),
+        ("SPU-3", "室内", "餐椅", "A", 100.0),
+    ]:
+        row = sample_frame().iloc[[0]].copy()
+        row["spu"] = spu
+        row["category"] = category
+        row["subcategory"] = subcategory
+        row["grade"] = grade
+        row["sales_amount"] = sales
+        rows.append(row)
+    frame = pd.concat(rows, ignore_index=True)
+
+    category_breakdown, _ = build_category_grade_breakdown(frame, "category")
+    subcategory_breakdown, top_subcategories = build_category_grade_breakdown(
+        frame, "subcategory", top_n=2
+    )
+
+    assert set(category_breakdown["category"]) == {"户外", "室内"}
+    assert set(subcategory_breakdown["subcategory"]) == {"餐桌", "摇椅", "餐椅"}
+    assert set(top_subcategories["subcategory"]) == {"餐桌", "摇椅"}
+    assert subcategory_breakdown.groupby("subcategory")["sales_amount"].sum().to_dict() == {
+        "摇椅": 200.0,
+        "餐椅": 100.0,
+        "餐桌": 300.0,
+    }
+
+
+def test_bundled_data_is_default_and_uploaded_year_overrides_it() -> None:
+    bundled_2025 = sample_frame().iloc[[0]].copy()
+    bundled_2025["source_year"] = 2025
+    bundled_2025["source_file"] = "2025.xlsx"
+    bundled_2026 = bundled_2025.copy()
+    bundled_2026["period"] = pd.Timestamp("2026-01-01")
+    bundled_2026["source_year"] = 2026
+    bundled_2026["source_file"] = "2026.xlsx"
+    bundled_2026["spu"] = "SPU-BUNDLED-2026"
+    bundled = pd.concat([bundled_2025, bundled_2026], ignore_index=True)
+
+    uploaded_2025 = bundled_2025.copy()
+    uploaded_2025["spu"] = "SPU-UPLOADED-2025"
+    uploaded_2025["source_file"] = "uploaded-2025.xlsx"
+
+    with TemporaryDirectory() as directory:
+        bundled_path = Path(directory) / "default.csv.gz"
+        bundled.to_csv(bundled_path, index=False, compression="gzip")
+        with patch("finance_bi.data_pipeline._read_source", return_value=uploaded_2025):
+            result = load_finance_data_with_defaults(
+                source_2025=b"uploaded",
+                source_name_2025="uploaded-2025.xlsx",
+                bundled_source=bundled_path,
+            )
+
+    assert set(result.loc[result["source_year"] == 2025, "spu"]) == {"SPU-UPLOADED-2025"}
+    assert set(result.loc[result["source_year"] == 2026, "spu"]) == {"SPU-BUNDLED-2026"}

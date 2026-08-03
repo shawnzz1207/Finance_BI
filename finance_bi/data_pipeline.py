@@ -15,6 +15,7 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BUNDLED_DATA_PATH = PROJECT_ROOT / "data" / "default_finance_data.csv.gz"
 DEFAULT_SOURCE_2025 = Path(
     os.environ.get(
         "FINANCE_BI_2025_PATH",
@@ -246,6 +247,16 @@ def _read_source(source: Source, year: int, source_name: str | None = None) -> p
     return result
 
 
+def _finalize_finance_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame["period"] = pd.to_datetime(frame["period"], errors="raise")
+    frame["source_year"] = pd.to_numeric(frame["source_year"], errors="raise").astype(int)
+    for field in _NUMERIC_FIELDS:
+        frame[field] = _numeric(frame[field])
+    frame["period_label"] = frame["period"].dt.strftime("%Y-%m")
+    return frame.sort_values(["period", "platform", "spu"], kind="stable").reset_index(drop=True)
+
+
 def load_finance_data(
     source_2025: Source = DEFAULT_SOURCE_2025,
     source_2026: Source = DEFAULT_SOURCE_2026,
@@ -260,8 +271,71 @@ def load_finance_data(
         ],
         ignore_index=True,
     )
-    frame["period_label"] = frame["period"].dt.strftime("%Y-%m")
-    return frame.sort_values(["period", "platform", "spu"], kind="stable").reset_index(drop=True)
+    return _finalize_finance_frame(frame)
+
+
+def load_bundled_finance_data(source: str | Path = BUNDLED_DATA_PATH) -> pd.DataFrame:
+    """Load the deployment-safe normalized snapshot bundled with the application."""
+    path = Path(source)
+    if not path.exists():
+        raise FileNotFoundError(f"未找到系统内置经营数据：{path}")
+    text_columns = [
+        "spu",
+        "platform",
+        "store",
+        "grade",
+        "category",
+        "subcategory",
+        "group",
+        "owner",
+        "source_file",
+    ]
+    frame = pd.read_csv(
+        path,
+        compression="infer",
+        dtype={column: "string" for column in text_columns},
+    )
+    required_columns = {"period", "source_year", *text_columns, *_NUMERIC_FIELDS}
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise ValueError(f"系统内置经营数据缺少字段：{', '.join(missing_columns)}")
+    frame["source_file"] = frame["source_file"].map(
+        lambda value: str(value) if str(value).endswith("（内置快照）") else f"{value}（内置快照）"
+    )
+    return _finalize_finance_frame(frame)
+
+
+def load_finance_data_with_defaults(
+    source_2025: Source | None = None,
+    source_2026: Source | None = None,
+    source_name_2025: str | None = None,
+    source_name_2026: str | None = None,
+    bundled_source: str | Path = BUNDLED_DATA_PATH,
+    fallback_source_2025: Source = DEFAULT_SOURCE_2025,
+    fallback_source_2026: Source = DEFAULT_SOURCE_2026,
+) -> pd.DataFrame:
+    """Use bundled yearly data by default and replace each year when a file is uploaded."""
+    bundled_path = Path(bundled_source)
+    bundled = (
+        load_bundled_finance_data(bundled_path)
+        if bundled_path.exists()
+        else pd.DataFrame()
+    )
+    frames: list[pd.DataFrame] = []
+    yearly_sources = [
+        (2025, source_2025, source_name_2025, fallback_source_2025),
+        (2026, source_2026, source_name_2026, fallback_source_2026),
+    ]
+    for year, uploaded_source, uploaded_name, fallback_source in yearly_sources:
+        if uploaded_source is not None:
+            frames.append(_read_source(uploaded_source, year, uploaded_name))
+            continue
+        bundled_year = bundled.loc[bundled["source_year"] == year].copy() if not bundled.empty else pd.DataFrame()
+        if not bundled_year.empty:
+            frames.append(bundled_year)
+        else:
+            frames.append(_read_source(fallback_source, year))
+    return _finalize_finance_frame(pd.concat(frames, ignore_index=True))
 
 
 def apply_filters(frame: pd.DataFrame, filters: Mapping[str, Sequence[str]]) -> pd.DataFrame:
@@ -512,6 +586,35 @@ def build_multi_metric_yoy_comparison(
         )
 
     return result
+
+
+def build_category_grade_breakdown(
+    frame: pd.DataFrame,
+    dimension: str,
+    top_n: int = 12,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the full and top-N product-grade breakdown at the requested category grain."""
+    if dimension not in {"category", "subcategory"}:
+        raise ValueError("类目产品分级分析仅支持大类目或子类目维度")
+    if frame.empty:
+        empty = pd.DataFrame(columns=[dimension, "grade", "SPU数", *METRIC_LABELS])
+        return empty, empty.copy()
+
+    breakdown = aggregate_pnl(frame, [dimension, "grade"])
+    spu_count = (
+        frame.groupby([dimension, "grade"], as_index=False)["spu"]
+        .nunique()
+        .rename(columns={"spu": "SPU数"})
+    )
+    breakdown = breakdown.merge(spu_count, on=[dimension, "grade"], how="left")
+
+    ranked_dimensions = (
+        aggregate_pnl(frame, [dimension])
+        .sort_values("sales_amount", ascending=False, kind="stable")
+        .head(max(int(top_n), 1))[dimension]
+    )
+    chart_breakdown = breakdown.loc[breakdown[dimension].isin(ranked_dimensions)].copy()
+    return breakdown, chart_breakdown
 
 
 def build_spu_benchmarks(selected_frame: pd.DataFrame, population_frame: pd.DataFrame) -> pd.DataFrame:

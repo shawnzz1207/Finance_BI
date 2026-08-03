@@ -14,6 +14,7 @@ import streamlit as st
 
 from finance_bi.data_pipeline import (
     ANALYSIS_DIMENSIONS,
+    BUNDLED_DATA_PATH,
     DEFAULT_SOURCE_2025,
     DEFAULT_SOURCE_2026,
     DIMENSION_LABELS,
@@ -22,12 +23,13 @@ from finance_bi.data_pipeline import (
     aggregate_pnl,
     apply_filters,
     available_dimension_values,
+    build_category_grade_breakdown,
     build_monthly_full_metrics,
     build_monthly_metric_analysis,
     build_multi_metric_yoy_comparison,
     build_overview_monthly_detail,
     build_spu_benchmarks,
-    load_finance_data,
+    load_finance_data_with_defaults,
     same_period_last_year,
     source_status,
 )
@@ -75,7 +77,7 @@ DEFAULT_OVERVIEW_CARD_LABELS = [
     "退款费用占比",
     "广告费占比",
 ]
-DATA_MODEL_VERSION = "2026-08-storage-cost-v1"
+DATA_MODEL_VERSION = "2026-08-category-grade-bundled-v2"
 MONTHLY_SERIES_COLORS = [
     COLORS["blue"],
     COLORS["gold"],
@@ -158,6 +160,8 @@ def inject_css() -> None:
 @st.cache_data(show_spinner="正在读取原表并汇总 SPU 经营数据…")
 def cached_load(
     data_model_version: str,
+    bundled_path: str,
+    bundled_mtime: float,
     path_2025: str,
     path_2026: str,
     mtime_2025: float,
@@ -167,12 +171,15 @@ def cached_load(
     upload_name_2025: str | None,
     upload_name_2026: str | None,
 ) -> pd.DataFrame:
-    del data_model_version, mtime_2025, mtime_2026
-    return load_finance_data(
-        upload_2025 if upload_2025 is not None else path_2025,
-        upload_2026 if upload_2026 is not None else path_2026,
+    del data_model_version, bundled_mtime, mtime_2025, mtime_2026
+    return load_finance_data_with_defaults(
+        upload_2025,
+        upload_2026,
         upload_name_2025,
         upload_name_2026,
+        bundled_source=bundled_path,
+        fallback_source_2025=path_2025,
+        fallback_source_2026=path_2026,
     )
 
 
@@ -210,7 +217,7 @@ def source_uploaders() -> tuple[object | None, object | None]:
                 key="source_upload_2026",
                 help="上传后替代系统默认的 2026 数据源，不会修改原文件。",
             )
-            st.caption("未上传的年度继续使用服务器默认原表；系统读取公式缓存值，并按既定字段位置运算。")
+            st.caption("系统默认加载内置的2025、2026数据；上传某一年度后，将直接覆盖该年度的内置数据。")
         st.markdown("---")
     return upload_2025, upload_2026
 
@@ -360,6 +367,8 @@ def bar_figure(
     category_label = DIMENSION_LABELS.get(category, category)
     metric_label = METRIC_LABELS.get(metric, metric)
     if horizontal:
+        category_values = ordered[category].astype(str).tolist()
+        ordered[category] = ordered[category].astype(str)
         fig = px.bar(
             ordered,
             x=metric,
@@ -369,7 +378,16 @@ def bar_figure(
             labels=labels,
             color_discrete_sequence=[color],
         )
-        fig.update_yaxes(categoryorder="array", categoryarray=ordered[category].tolist(), title=category_label)
+        fig.update_yaxes(
+            categoryorder="array",
+            categoryarray=category_values,
+            tickmode="array",
+            tickvals=category_values,
+            ticktext=category_values,
+            title=category_label,
+            automargin=True,
+            ticklabeloverflow="allow",
+        )
         fig.update_xaxes(tickformat=".0%" if metric_is_rate else ",.0f", title=metric_label)
         value_format = ".2%" if metric_is_rate else ",.2f"
         fig.update_traces(
@@ -395,8 +413,9 @@ def bar_figure(
             hovertemplate=f"{category_label}=%{{x}}<br>{metric_label}=%{{y:{value_format}}}<extra></extra>",
         )
     fig.update_layout(title={"text": title, "font": {"size": 14, "color": COLORS["ink"]}})
-    fig = style_figure(fig, height=350)
-    fig.update_layout(margin={"l": 14, "r": 88, "t": 50, "b": 20})
+    chart_height = max(350, min(760, 26 * len(ordered) + 120)) if horizontal else 350
+    fig = style_figure(fig, height=chart_height)
+    fig.update_layout(margin={"l": 18, "r": 88, "t": 62, "b": 24})
     return fig
 
 
@@ -1444,26 +1463,22 @@ def category_grade_page(
     else:
         st.info("选择 2026 年并开启“同时显示 2025 同期”后，可查看该层级同比。")
 
-    st.markdown("#### 类目 × 产品分级")
-    cross = aggregate_pnl(current, ["category", "grade"])
-    cross_spu = (
-        current.groupby(["category", "grade"], as_index=False)["spu"]
-        .nunique()
-        .rename(columns={"spu": "SPU数"})
-    )
-    cross = cross.merge(cross_spu, on=["category", "grade"], how="left")
-    top_categories = aggregate_pnl(current, ["category"]).nlargest(12, "sales_amount")["category"]
-    cross_chart = cross.loc[cross["category"].isin(top_categories)].copy()
+    cross_dimension = "subcategory" if dimension == "subcategory" else "category"
+    cross_dimension_label = DIMENSION_LABELS[cross_dimension]
+    st.markdown(f"#### {cross_dimension_label} × 产品分级")
+    if cross_dimension == "subcategory":
+        st.caption("按当前筛选范围下的子类目汇总产品分级结构，不再回退到大类目颗粒度。")
+    cross, cross_chart = build_category_grade_breakdown(current, cross_dimension, top_n=12)
     grade_order = [*GRADE_ORDER, *sorted(set(cross_chart["grade"]) - set(GRADE_ORDER))]
     cross_chart["grade"] = pd.Categorical(
         cross_chart["grade"], categories=grade_order, ordered=True
     )
-    cross_chart = cross_chart.sort_values(["grade", "category"])
+    cross_chart = cross_chart.sort_values(["grade", cross_dimension])
     cross_chart["图表数值"] = cross_chart["sales_amount"].map(amount)
     fig = px.bar(
         cross_chart,
         x="sales_amount",
-        y="category",
+        y=cross_dimension,
         color="grade",
         orientation="h",
         text="图表数值",
@@ -1473,18 +1488,32 @@ def category_grade_page(
         barmode="group",
     )
     fig.update_xaxes(title="销售额", tickformat=",.0f")
-    fig.update_yaxes(title="大类目", categoryorder="total ascending")
+    fig.update_yaxes(
+        title=cross_dimension_label,
+        categoryorder="total ascending",
+        automargin=True,
+        ticklabeloverflow="allow",
+    )
     fig.update_traces(
         textposition="outside",
         cliponaxis=False,
-        hovertemplate="大类目=%{y}<br>产品分级=%{fullData.name}<br>销售额=%{x:,.2f}<extra></extra>",
+        hovertemplate=(
+            f"{cross_dimension_label}=%{{y}}<br>产品分级=%{{fullData.name}}"
+            "<br>销售额=%{x:,.2f}<extra></extra>"
+        ),
     )
-    fig.update_layout(title={"text": "重点类目的产品分级销售结构", "font": {"size": 14}})
-    fig = style_figure(fig, height=520, show_legend=True)
-    fig.update_layout(margin={"l": 14, "r": 86, "t": 50, "b": 24})
+    fig.update_layout(
+        title={"text": f"重点{cross_dimension_label}的产品分级销售结构", "font": {"size": 14}}
+    )
+    fig = style_figure(
+        fig,
+        height=max(520, min(780, 42 * cross_chart[cross_dimension].nunique() + 180)),
+        show_legend=True,
+    )
+    fig.update_layout(margin={"l": 18, "r": 86, "t": 62, "b": 28})
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     cross_columns = [
-        "category",
+        cross_dimension,
         "grade",
         "SPU数",
         "sales_amount",
@@ -1518,19 +1547,21 @@ def definitions_page(data: pd.DataFrame) -> None:
         <b>核心费用：</b>采购成本、头程费用、海外仓尾程费用及调整、仓储成本、退款费用、广告费用、库存折损。费用率分母均为销售额合计。<br>
         <b>同期对比：</b>选择 2026 年并开启“同时显示 2025 同期”后，对比数据会直接进入经营总览、自由分析、SPU诊断和产品分级&类目。<br>
         <b>月度与环比：</b>自由分析“月度”模式按自然月展示所选期间固定 TOP N；金额指标环比以百分比展示，成本占比及毛利率环比以 pp 展示；上月无数据时留空。<br>
-        <b>中位数：</b>按平台独立计算；子类目中位数按“平台 × 大类目 × 子类目”，平台全品类中位数按“平台”；中位数样本仅使用销售额大于 0 的 SPU。
+        <b>中位数：</b>按平台独立计算；子类目中位数按“平台 × 大类目 × 子类目”，平台全品类中位数按“平台”；中位数样本仅使用销售额大于 0 的 SPU。<br>
+        <b>默认数据：</b>系统内置现有2025、2026经营数据快照；上传某一年度原表后，该年度数据直接覆盖内置快照。
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.markdown("#### 数据源状态")
     status = source_status(data)
-    st.dataframe(status, width="stretch", hide_index=True)
-    st.caption("支持在左侧导入两年度原始经营报表；外链 XLOOKUP 按当前缓存结果读取为数值，2026 原表第 3 行汇总缓存不参与任何计算。")
+    st.dataframe(display_table(status), width="stretch", hide_index=True)
+    st.caption("系统默认加载两年度内置快照；左侧上传某一年度后直接覆盖该年度。外链 XLOOKUP 按当前缓存结果读取为数值，2026 原表第 3 行汇总缓存不参与任何计算。")
 
 
 def main() -> None:
     inject_css()
+    bundled_source = Path(BUNDLED_DATA_PATH)
     source_2025, source_2026 = Path(DEFAULT_SOURCE_2025), Path(DEFAULT_SOURCE_2026)
     uploaded_2025, uploaded_2026 = source_uploaders()
     upload_bytes_2025 = uploaded_2025.getvalue() if uploaded_2025 is not None else None
@@ -1540,6 +1571,8 @@ def main() -> None:
     try:
         data = cached_load(
             DATA_MODEL_VERSION,
+            str(bundled_source),
+            current_mtime(bundled_source),
             str(source_2025),
             str(source_2026),
             current_mtime(source_2025),

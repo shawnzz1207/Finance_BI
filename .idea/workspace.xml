@@ -4,12 +4,11 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="2cd7de3c-873a-49f4-84b3-f1fa9746a973" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/Finance_BI.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    <list default="true" id="2cd7de3c-873a-49f4-84b3-f1fa9746a973" name="更改" comment="财务报表BI看板1.0更新">
+      <change beforePath="$PROJECT_DIR$/FinanceBI.py" beforeDir="false" afterPath="$PROJECT_DIR$/FinanceBI.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/finance_bi/data_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/finance_bi/data_pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/test_data_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/tests/test_data_pipeline.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -19,6 +18,18 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
+  "lastFilter": {
+    "state": "OPEN",
+    "assignee": "shawnzz1207"
+  }
+}]]></component>
+  <component name="GithubPullRequestsUISettings"><![CDATA[{
+  "selectedUrlAndAccountId": {
+    "url": "https://github.com/shawnzz1207/Finance_BI.git",
+    "accountId": "ec745e97-3244-4b68-bb82-c05c96cf4ba2"
+  }
+}]]></component>
   <component name="McpProjectServerCommands">
     <commands />
     <urls />
@@ -166,7 +177,28 @@
       <option name="presentableId" value="Default" />
       <updated>1785723295932</updated>
     </task>
+    <task id="LOCAL-00001" summary="财务报表BI看板1.0更新">
+      <option name="closed" value="true" />
+      <created>1785724783223</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1785724783223</updated>
+    </task>
+    <task id="LOCAL-00002" summary="财务报表BI看板1.0更新">
+      <option name="closed" value="true" />
+      <created>1785724955196</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1785724955196</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="财务报表BI看板1.0更新" />
+    <option name="LAST_COMMIT_MESSAGE" value="财务报表BI看板1.0更新" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>
