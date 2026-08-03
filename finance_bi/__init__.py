@@ -1,0 +1,1 @@
+"""Finance BI dashboard package."""
