@@ -20,16 +20,22 @@ from finance_bi.data_pipeline import (
     DIMENSION_LABELS,
     METRIC_LABELS,
     RATE_METRICS,
+    add_spu_benchmark_deltas,
     aggregate_pnl,
     apply_filters,
     available_dimension_values,
+    build_c_series_overview,
+    build_c_series_structure,
     build_category_grade_breakdown,
+    build_deteriorated_spu_analysis,
+    build_improved_spu_analysis,
     build_monthly_full_metrics,
     build_monthly_metric_analysis,
     build_multi_metric_yoy_comparison,
     build_overview_monthly_detail,
     build_spu_benchmarks,
     load_finance_data_with_defaults,
+    normalize_group_comparison,
     same_period_last_year,
     source_status,
 )
@@ -72,6 +78,8 @@ COST_METRIC_KEYS = {metric for pair in COST_OPTIONS.values() for metric in pair}
 DEFAULT_OVERVIEW_CARD_LABELS = [
     "销售额",
     "毛利额-1",
+    "品效-销售额",
+    "品效-毛利额",
     "毛利率-1",
     "采购成本占比",
     "退款费用占比",
@@ -1150,6 +1158,9 @@ def free_analysis_page(
                 *([previous_column, mom_column] if display_mode == "月度" else []),
                 "sales_amount",
                 "standard_gross_profit_1",
+                "有效SPU数",
+                "sales_per_active_spu",
+                "gross_profit_per_active_spu",
                 "gross_margin_1",
                 "purchase_rate",
                 "first_leg_rate",
@@ -1213,20 +1224,31 @@ def spu_page(
         "广告费占比": "ad_rate",
         "库存折损占比": "inventory_depreciation_rate",
     }
-    selected_label = st.selectbox("对标费用率", list(benchmark_options), key="spu_benchmark_metric")
-    metric = benchmark_options[selected_label]
-    view["子类目中位数差异"] = view[metric] - view[f"subcategory_median_{metric}"]
+    selected_labels = st.multiselect(
+        "对标费用率",
+        list(benchmark_options),
+        default=["采购成本占比"],
+        key="spu_benchmark_metrics",
+        help="支持同时选择多个费用率；各费用率将按字段分列汇总在下方同一张SPU诊断明细表中。",
+    )
+    if not selected_labels:
+        st.info("请至少选择一项对标费用率。")
+        return
+    selected_metrics = [benchmark_options[label] for label in selected_labels]
+    view = add_spu_benchmark_deltas(view, selected_metrics)
 
     left, right = st.columns([1.15, 1])
     with left:
         scatter = view.loc[view["sales_amount"] > 0].nlargest(300, "sales_amount")
+        scatter_hover_data = {"platform": True, "category": True, "sales_amount": ":,.0f"}
+        scatter_hover_data.update({metric: ":.2%" for metric in selected_metrics})
         fig = px.scatter(
             scatter,
             x="sales_amount",
             y="gross_margin_1",
             color="grade",
             hover_name="spu",
-            hover_data={"platform": True, "category": True, metric: ":.2%", "sales_amount": ":,.0f"},
+            hover_data=scatter_hover_data,
             labels={**DIMENSION_LABELS, **METRIC_LABELS},
             color_discrete_sequence=[COLORS["blue"], COLORS["gold"], COLORS["orange"], COLORS["slate"], "#7761C7"],
         )
@@ -1234,25 +1256,29 @@ def spu_page(
         fig.update_yaxes(tickformat=".0%")
         st.plotly_chart(style_figure(fig, height=400, show_legend=True), width="stretch", config={"displayModeBar": False})
     with right:
-        comparison = view.nlargest(12, "sales_amount").sort_values("子类目中位数差异")
-        fig = px.bar(
-            comparison,
-            x="子类目中位数差异",
-            y="spu",
-            orientation="h",
-            text=comparison["子类目中位数差异"].map(rate),
-            labels={"spu": "SPU", "子类目中位数差异": "子类目中位数差异"},
-            color_discrete_sequence=[COLORS["orange"]],
+        comparison = view.nlargest(12, "sales_amount").copy()
+        gap_columns = [f"{metric}_subcategory_median_gap" for metric in selected_metrics]
+        heatmap_values = comparison.loc[:, gap_columns].mul(100).to_numpy()
+        heatmap_text = comparison.loc[:, gap_columns].map(lambda value: pp(value)).to_numpy()
+        fig = go.Figure(
+            go.Heatmap(
+                z=heatmap_values,
+                x=selected_labels,
+                y=comparison["spu"],
+                text=heatmap_text,
+                texttemplate="%{text}",
+                textfont={"size": 11},
+                colorscale=[[0, "#12B76A"], [0.5, "#F8FAFC"], [1, "#F04438"]],
+                zmid=0,
+                colorbar={"title": "偏差（pp）"},
+                hovertemplate="SPU=%{y}<br>费用率=%{x}<br>相对子类目中位数偏差=%{z:.2f}pp<extra></extra>",
+            )
         )
-        fig.update_layout(title={"text": f"Top SPU 的{selected_label}偏离子类目中位数", "font": {"size": 14}})
-        fig.update_xaxes(tickformat=".1%", zeroline=True, zerolinecolor=COLORS["slate"])
-        fig.update_traces(
-            textposition="outside",
-            cliponaxis=False,
-            hovertemplate=f"SPU=%{{y}}<br>{selected_label}相对子类目偏差=%{{x:.2%}}<extra></extra>",
-        )
-        fig = style_figure(fig, height=400)
-        fig.update_layout(margin={"l": 14, "r": 82, "t": 50, "b": 24})
+        fig.update_layout(title={"text": "Top SPU 多项费用率偏离子类目中位数", "font": {"size": 14}})
+        fig.update_xaxes(title="对标费用率", side="top")
+        fig.update_yaxes(title="SPU", autorange="reversed", automargin=True)
+        fig = style_figure(fig, height=max(400, min(620, 31 * len(comparison) + 125)))
+        fig.update_layout(margin={"l": 14, "r": 88, "t": 64, "b": 24})
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
     display_columns = [
@@ -1262,15 +1288,24 @@ def spu_page(
         "category",
         "subcategory",
         "sales_amount",
+        "sales_share_of_total_sales",
         "standard_gross_profit_1",
+        "gross_profit_share_of_total_sales",
         "gross_margin_1",
-        metric,
-        f"subcategory_median_{metric}",
-        f"platform_median_{metric}",
-        "子类目中位数差异",
         "subcategory_spu_sample",
     ]
+    for metric in selected_metrics:
+        display_columns.extend(
+            [
+                metric,
+                f"subcategory_median_{metric}",
+                f"platform_median_{metric}",
+                f"{metric}_subcategory_median_gap",
+                f"{metric}_platform_median_gap",
+            ]
+        )
     table = view.loc[:, display_columns].sort_values("sales_amount", ascending=False).head(150)
+    st.markdown(f"#### SPU费用率对标明细 · {len(selected_metrics)}项费用率")
     st.dataframe(display_table(table), width="stretch", hide_index=True, height=420)
     export_table = view.loc[:, display_columns].sort_values("sales_amount", ascending=False)
     st.download_button(
@@ -1318,6 +1353,344 @@ def spu_page(
             )
 
 
+def structure_bar_figure(
+    data: pd.DataFrame,
+    dimension: str,
+    metric: str,
+    title: str,
+    metric_label: str,
+    display_kind: str = "amount",
+    color: str = COLORS["blue"],
+) -> go.Figure:
+    """Render a directly-labelled health chart for fields outside the P&L metric map."""
+    ordered = data.dropna(subset=[metric]).sort_values(metric, ascending=True, kind="stable").copy()
+    if display_kind == "rate":
+        ordered["图表数值"] = ordered[metric].map(rate)
+        tick_format, value_format = ".0%", ".2%"
+    elif display_kind == "number":
+        ordered["图表数值"] = ordered[metric].map(
+            lambda value: "—" if pd.isna(value) else f"{float(value):,.0f}"
+        )
+        tick_format, value_format = ",.0f", ",.0f"
+    else:
+        ordered["图表数值"] = ordered[metric].map(amount)
+        tick_format, value_format = ",.0f", ",.2f"
+    dimension_label = DIMENSION_LABELS.get(dimension, dimension)
+    fig = px.bar(
+        ordered,
+        x=metric,
+        y=dimension,
+        orientation="h",
+        text="图表数值",
+        labels={dimension: dimension_label, metric: metric_label, "图表数值": "数值"},
+        color_discrete_sequence=[color],
+    )
+    fig.update_xaxes(tickformat=tick_format, title=metric_label)
+    fig.update_yaxes(title=dimension_label, automargin=True, ticklabeloverflow="allow")
+    fig.update_traces(
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate=(
+            f"{dimension_label}=%{{y}}<br>{metric_label}=%{{x:{value_format}}}<extra></extra>"
+        ),
+    )
+    fig.update_layout(title={"text": title, "font": {"size": 14}})
+    fig = style_figure(fig, height=max(340, min(680, 34 * len(ordered) + 140)))
+    fig.update_layout(margin={"l": 18, "r": 86, "t": 54, "b": 24})
+    return fig
+
+
+def product_structure_health_section(
+    current: pd.DataFrame,
+    prior: pd.DataFrame,
+    year: int,
+    yoy_enabled: bool,
+) -> None:
+    """Keep the three product-health analyses in one selectable section."""
+    st.markdown("### 产品结构与SPU表现")
+    st.markdown(
+        "<p class='section-note'>三个分析共用左侧的期间、业务范围、产品范围与SPU筛选。组别同比会先应用已确认的 2025→2026 组别映射；未映射的迁入/迁出对象会单独标注。</p>",
+        unsafe_allow_html=True,
+    )
+    if year != 2026 or not yoy_enabled or prior.empty:
+        st.info("选择 2026 年并开启“同时显示 2025 同期”后，可查看产品结构与SPU表现的同比诊断。")
+        return
+
+    dimension_options = {"按平台": "platform", "按组别": "group"}
+    selected_dimension_label = st.segmented_control(
+        "归集维度",
+        options=list(dimension_options),
+        default="按平台",
+        key="product_health_dimension",
+    ) or "按平台"
+    dimension = dimension_options[selected_dimension_label]
+    analysis_options = {
+        "C系列结构": "c_structure",
+        "表现变差SPU": "deteriorated_spu",
+        "表现变好SPU": "improved_spu",
+    }
+    selected_analysis = st.segmented_control(
+        "分析主题",
+        options=list(analysis_options),
+        default="C系列结构",
+        key="product_health_analysis",
+    ) or "C系列结构"
+    dimension_label = DIMENSION_LABELS[dimension]
+
+    if analysis_options[selected_analysis] == "c_structure":
+        structure = build_c_series_structure(current, prior, dimension)
+        overview = build_c_series_overview(current, prior).iloc[0]
+        if structure.empty:
+            st.info("当前筛选条件下没有可展示的 C 系列结构数据。")
+            return
+        card_1, card_2, card_3 = st.columns(3)
+        c_spu_count_delta = overview["C系列SPU数增减"]
+        c_spu_count_yoy = overview["C系列SPU数同比"]
+        if pd.isna(c_spu_count_yoy):
+            c_spu_count_delta_label = f"{c_spu_count_delta:+,.0f} 个 · 无同期"
+        else:
+            c_spu_count_delta_label = f"{c_spu_count_delta:+,.0f} 个 · {c_spu_count_yoy:+.2%} 同比"
+        card_1.metric(
+            "C系列SPU数",
+            f"{overview['本期C系列SPU数']:,.0f}",
+            delta=c_spu_count_delta_label,
+        )
+        card_2.metric(
+            "C系列销售额占比",
+            rate(overview["本期C系列销售额占比"]),
+            delta=pp(overview["C系列销售额占比变化"]),
+        )
+        card_3.metric(
+            "C系列SPU占比",
+            rate(overview["本期C系列SPU占比"]),
+            delta=pp(overview["C系列SPU占比变化"]),
+        )
+        st.caption("顶部指标卡按当前筛选范围去重 SPU 计算；下方明细按所选平台或组别切片展示。C 系列指 C+、C-、C--，统计规则与“产品分级”明细表一致：所选期间内曾归为 C 系列的 SPU 计入 C 系列。占比变化以 pp 表示。")
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(
+                structure_bar_figure(
+                    structure,
+                    dimension,
+                    "本期C系列销售额占比",
+                    f"各{dimension_label}C系列销售额占比",
+                    "C系列销售额占比",
+                    "rate",
+                    COLORS["orange"],
+                ),
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+        with right:
+            st.plotly_chart(
+                structure_bar_figure(
+                    structure,
+                    dimension,
+                    "本期C系列SPU占比",
+                    f"各{dimension_label}C系列SPU占比",
+                    "C系列SPU占比",
+                    "rate",
+                    COLORS["gold"],
+                ),
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+        structure_columns = [
+            dimension,
+            "同比可比状态",
+            "本期SPU数",
+            "去年同期SPU数",
+            "本期C系列SPU数",
+            "去年同期C系列SPU数",
+            "C系列SPU数增减",
+            "C系列SPU数同比",
+            "本期C系列SPU占比",
+            "去年同期C系列SPU占比",
+            "C系列SPU占比变化",
+            "本期C系列销售额",
+            "去年同期C系列销售额",
+            "C系列销售额同比",
+            "本期C系列销售额占比",
+            "去年同期C系列销售额占比",
+            "C系列销售额占比变化",
+        ]
+        st.dataframe(
+            display_table(structure.loc[:, structure_columns], missing_as_dash=True),
+            width="stretch",
+            hide_index=True,
+            height=360,
+        )
+        st.download_button(
+            "导出C系列结构明细（CSV）",
+            data=chinese_headers(structure.loc[:, structure_columns]).to_csv(index=False).encode("utf-8-sig"),
+            file_name="c_series_structure_yoy.csv",
+            mime="text/csv",
+            key=f"c_series_download_{dimension}",
+        )
+        return
+
+    if analysis_options[selected_analysis] == "deteriorated_spu":
+        summary, detail = build_deteriorated_spu_analysis(current, prior, dimension)
+        if detail.empty:
+            st.info("当前筛选范围内没有“本期为 S/A/B 级，且销售额与毛利额-1均低于去年同期”的存量 SPU。")
+            return
+        card_1, card_2, card_3 = st.columns(3)
+        card_1.metric("表现变差SPU数", f"{detail['spu'].nunique():,.0f}")
+        card_2.metric("销售额变动", amount(detail["销售额变动"].sum()))
+        card_3.metric("毛利额-1变动", amount(detail["毛利额-1变动"].sum()))
+        st.caption("仅纳入本期分级为 S/A/B 的存量SPU，且销售额、毛利额-1均低于去年同期；“下降优先级”同时考虑两项绝对降幅。")
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(
+                structure_bar_figure(
+                    summary,
+                    dimension,
+                    "销售额同比",
+                    f"各{dimension_label}变差SPU销售额同比",
+                    "销售额同比",
+                    "rate",
+                    COLORS["orange"],
+                ),
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+        with right:
+            focus = detail.nsmallest(15, "销售额变动").copy()
+            focus["分析对象"] = focus[dimension].astype(str) + " · " + focus["spu"].astype(str)
+            st.plotly_chart(
+                structure_bar_figure(
+                    focus,
+                    "分析对象",
+                    "销售额变动",
+                    "重点变差SPU销售额降幅",
+                    "销售额变动",
+                    "amount",
+                    COLORS["gold"],
+                ),
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+        summary_columns = [
+            dimension,
+            "表现变差SPU数",
+            "本期销售额",
+            "去年同期销售额",
+            "销售额变动",
+            "销售额同比",
+            "本期毛利额-1",
+            "去年同期毛利额-1",
+            "毛利额-1变动",
+            "毛利额-1同比",
+        ]
+        st.dataframe(display_table(summary.loc[:, summary_columns], missing_as_dash=True), width="stretch", hide_index=True, height=300)
+        detail_columns = [
+            dimension,
+            "spu",
+            "本期产品分级",
+            "去年同期产品分级",
+            "本期销售额",
+            "去年同期销售额",
+            "销售额变动",
+            "销售额同比",
+            "本期毛利额-1",
+            "去年同期毛利额-1",
+            "毛利额-1变动",
+            "毛利额-1同比",
+            "下降优先级",
+        ]
+        with st.expander(f"查看全部 {len(detail)} 条变差SPU明细", expanded=False):
+            st.dataframe(display_table(detail.loc[:, detail_columns], missing_as_dash=True), width="stretch", hide_index=True, height=420)
+            st.download_button(
+                "导出表现变差SPU明细（CSV）",
+                data=chinese_headers(detail.loc[:, detail_columns]).to_csv(index=False).encode("utf-8-sig"),
+                file_name="deteriorated_spu_yoy.csv",
+                mime="text/csv",
+                key=f"deteriorated_spu_download_{dimension}",
+            )
+        return
+
+    top_n = st.select_slider(
+        "Top SPU数量",
+        options=[10, 20, 50],
+        value=20,
+        key=f"improved_spu_top_n_{dimension}",
+    )
+    summary, top = build_improved_spu_analysis(current, prior, dimension, top_n=top_n)
+    if top.empty:
+        st.info("当前筛选范围内没有销售额与毛利额-1均高于去年同期的存量 SPU。")
+        return
+    card_1, card_2, card_3 = st.columns(3)
+    card_1.metric(f"Top{top_n}表现变好SPU", f"{len(top):,.0f}")
+    card_2.metric("Top销售额增长", amount(top["销售额变动"].sum()))
+    card_3.metric("Top毛利额-1增长", amount(top["毛利额-1变动"].sum()))
+    st.caption("候选范围为所有本期分级的存量SPU，要求销售额与毛利额-1均实现正增长；Top排序将销售额和毛利额-1的绝对增量排名等权合并。")
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(
+            structure_bar_figure(
+                summary,
+                dimension,
+                "Top销售额增长",
+                f"Top{top_n}表现变好SPU的{dimension_label}贡献",
+                "Top销售额增长",
+                "amount",
+                COLORS["blue"],
+            ),
+            width="stretch",
+            config={"displayModeBar": False},
+        )
+    with right:
+        top_chart = top.copy()
+        top_chart["分析对象"] = top_chart[dimension].astype(str) + " · " + top_chart["spu"].astype(str)
+        st.plotly_chart(
+            structure_bar_figure(
+                top_chart,
+                "分析对象",
+                "销售额变动",
+                f"Top{top_n} SPU销售额绝对增长",
+                "销售额增长",
+                "amount",
+                COLORS["gold"],
+            ),
+            width="stretch",
+            config={"displayModeBar": False},
+        )
+    summary_columns = [
+        dimension,
+        "表现变好SPU数",
+        "销售额同比",
+        "毛利额-1同比",
+        "Top入选SPU数",
+        "Top销售额增长",
+        "Top毛利额-1增长",
+    ]
+    st.dataframe(display_table(summary.loc[:, summary_columns], missing_as_dash=True), width="stretch", hide_index=True, height=300)
+    top_columns = [
+        "全局增长排名",
+        dimension,
+        "spu",
+        "本期产品分级",
+        "去年同期产品分级",
+        "本期销售额",
+        "去年同期销售额",
+        "销售额变动",
+        "销售额同比",
+        "本期毛利额-1",
+        "去年同期毛利额-1",
+        "毛利额-1变动",
+        "毛利额-1同比",
+        "综合增长排名",
+    ]
+    st.dataframe(display_table(top.loc[:, top_columns], missing_as_dash=True), width="stretch", hide_index=True, height=420)
+    st.download_button(
+        "导出表现变好SPU明细（CSV）",
+        data=chinese_headers(top.loc[:, top_columns]).to_csv(index=False).encode("utf-8-sig"),
+        file_name="improved_spu_top_yoy.csv",
+        mime="text/csv",
+        key=f"improved_spu_download_{dimension}",
+    )
+
+
 def category_grade_page(
     current: pd.DataFrame,
     prior: pd.DataFrame,
@@ -1326,9 +1699,18 @@ def category_grade_page(
 ) -> None:
     st.markdown("## 产品分级&类目")
     st.markdown(
-        "<p class='section-note'>在产品分级、大类目和子类目之间切换；同步查看经营数据、同比表现及类目内的产品分级结构。</p>",
+        "<p class='section-note'>在产品分级、大类目和子类目之间切换；也可进入产品结构与SPU表现，用同一组筛选完成 C 系列、变差SPU与变好SPU的同比诊断。</p>",
         unsafe_allow_html=True,
     )
+    page_view = st.segmented_control(
+        "产品分析视图",
+        options=["经营表现", "产品结构与SPU表现"],
+        default="经营表现",
+        key="category_grade_page_view",
+    ) or "经营表现"
+    if page_view == "产品结构与SPU表现":
+        product_structure_health_section(current, prior, year, yoy_enabled)
+        return
     level_options = {"产品分级": "grade", "大类目": "category", "子类目": "subcategory"}
     selected_level = st.segmented_control(
         "分析层级",
@@ -1339,14 +1721,10 @@ def category_grade_page(
     selected_level = selected_level or "产品分级"
     dimension = level_options[selected_level]
     view = aggregate_pnl(current, [dimension])
-    spu_count = (
-        current.groupby(dimension, as_index=False)["spu"]
-        .nunique()
-        .rename(columns={"spu": "SPU数"})
-    )
-    view = view.merge(spu_count, on=dimension, how="left").sort_values("sales_amount", ascending=False)
+    view = view.sort_values("sales_amount", ascending=False)
 
     st.markdown(f"#### {selected_level or '产品分级'}经营表现")
+    st.caption("有效SPU数仅统计当前筛选期间销售额大于 0 的 SPU，与“SPU 诊断”的子类目样本数保持一致；零销售 SPU 不计入该数量。")
     left, right = st.columns(2)
     with left:
         st.plotly_chart(
@@ -1371,9 +1749,11 @@ def category_grade_page(
 
     table_columns = [
         dimension,
-        "SPU数",
+        "有效SPU数",
         "sales_amount",
         "standard_gross_profit_1",
+        "sales_per_active_spu",
+        "gross_profit_per_active_spu",
         "gross_margin_1",
         "purchase_rate",
         "first_leg_rate",
@@ -1515,9 +1895,11 @@ def category_grade_page(
     cross_columns = [
         cross_dimension,
         "grade",
-        "SPU数",
+        "有效SPU数",
         "sales_amount",
         "standard_gross_profit_1",
+        "sales_per_active_spu",
+        "gross_profit_per_active_spu",
         "gross_margin_1",
         "purchase_rate",
         "tail_rate",
@@ -1545,9 +1927,12 @@ def definitions_page(data: pd.DataFrame) -> None:
         <b>库存折损：</b>取原表库存折损源值的成本符号（源值为负时转为正成本），并纳入成本金额和成本占比分析。<br>
         <b>仓储成本：</b>取原表“海外仓仓储费用”，沿用成本符号口径（源值为负时转为正成本）；正数冲减值保留为负成本。<br>
         <b>核心费用：</b>采购成本、头程费用、海外仓尾程费用及调整、仓储成本、退款费用、广告费用、库存折损。费用率分母均为销售额合计。<br>
+        <b>品效：</b>有效SPU数为当前筛选范围内销售额大于 0 的去重SPU数；品效-销售额=总销售额/有效SPU数，品效-毛利额=毛利额-1/有效SPU数。<br>
+        <b>SPU贡献占比：</b>销售额占总销售额占比=SPU销售额/当前筛选范围总销售额；毛利额-1占总销售额占比=SPU毛利额-1/当前筛选范围总销售额，用于衡量单品对整体毛利率的贡献。<br>
         <b>同期对比：</b>选择 2026 年并开启“同时显示 2025 同期”后，对比数据会直接进入经营总览、自由分析、SPU诊断和产品分级&类目。<br>
         <b>月度与环比：</b>自由分析“月度”模式按自然月展示所选期间固定 TOP N；金额指标环比以百分比展示，成本占比及毛利率环比以 pp 展示；上月无数据时留空。<br>
         <b>中位数：</b>按平台独立计算；子类目中位数按“平台 × 大类目 × 子类目”，平台全品类中位数按“平台”；中位数样本仅使用销售额大于 0 的 SPU。<br>
+        <b>产品结构与SPU表现：</b>C系列为 C+、C-、C--，按所选期间的原始产品分级统计，与“产品分级”明细表保持一致；变差SPU为本期 S/A/B 级且销售额、毛利额-1双降的存量SPU；变好SPU为销售额、毛利额-1双增的存量SPU，按两项绝对增量排名等权取 Top N。<br>
         <b>默认数据：</b>系统内置现有2025、2026经营数据快照；上传某一年度原表后，该年度数据直接覆盖内置快照。
         </div>
         """,
@@ -1601,7 +1986,10 @@ def main() -> None:
     prior = pd.DataFrame(columns=data.columns)
     if selected_year == 2026 and yoy_enabled:
         prior_base = data.loc[data["period"].isin(same_period_last_year(periods))]
-        prior = apply_filters(prior_base, filters)
+        # Apply confirmed historical group mappings before cascading the current
+        # group selector to the prior year.  Otherwise a renamed 2025 group would
+        # disappear from the comparison as soon as its 2026 name is selected.
+        prior = apply_filters(normalize_group_comparison(prior_base), filters)
     scope = current_scope_text(periods, selected_year)
 
     st.markdown(

@@ -8,16 +8,23 @@ import pandas as pd
 
 from finance_bi.data_pipeline import (
     METRIC_LABELS,
+    active_spu_counts,
     aggregate_pnl,
     apply_filters,
     available_dimension_values,
     build_category_grade_breakdown,
+    build_c_series_structure,
+    build_c_series_overview,
+    build_deteriorated_spu_analysis,
+    build_improved_spu_analysis,
     build_monthly_metric_analysis,
     build_monthly_full_metrics,
     build_overview_monthly_detail,
     build_multi_metric_yoy_comparison,
     build_spu_benchmarks,
+    add_spu_benchmark_deltas,
     load_finance_data_with_defaults,
+    normalize_group_comparison,
 )
 from finance_bi.ui import chinese_headers, display_table
 
@@ -62,6 +69,23 @@ def test_standard_gross_profit_uses_confirmed_formula() -> None:
     assert result.loc[0, "storage_cost"] == 8.0
     assert result.loc[0, "storage_rate"] == 0.04
     assert "standard_gross_profit_2" not in METRIC_LABELS
+
+
+def test_product_efficiency_uses_positive_sales_spu_count() -> None:
+    active = sample_frame().iloc[[0]].copy()
+    active["spu"] = "SPU-ON"
+    active["sales_amount"] = 100.0
+    active["gross_profit_1_raw"] = 20.0
+    inactive = active.copy()
+    inactive["spu"] = "SPU-OFF"
+    inactive["sales_amount"] = 0.0
+    inactive["gross_profit_1_raw"] = 0.0
+
+    result = aggregate_pnl(pd.concat([active, inactive], ignore_index=True), [])
+
+    assert result.loc[0, "有效SPU数"] == 1
+    assert result.loc[0, "sales_per_active_spu"] == 100.0
+    assert result.loc[0, "gross_profit_per_active_spu"] == 20.0
 
 
 def test_visible_filter_does_not_depend_on_sku_or_msku() -> None:
@@ -127,6 +151,43 @@ def test_spu_benchmarks_separate_subcategories() -> None:
     assert abs(result.loc["SPU-3", "subcategory_median_purchase_rate"] - 0.70) < 1e-12
     assert result.loc["SPU-1", "subcategory_spu_sample"] == 2
     assert result.loc["SPU-3", "subcategory_spu_sample"] == 2
+    assert abs(result.loc["SPU-1", "sales_share_of_total_sales"] - 0.25) < 1e-12
+    assert abs(result.loc["SPU-1", "gross_profit_share_of_total_sales"] - 0.05) < 1e-12
+    result = add_spu_benchmark_deltas(
+        result.reset_index(),
+        ["purchase_rate", "first_leg_rate"],
+    ).set_index("spu")
+    assert abs(result.loc["SPU-1", "purchase_rate_subcategory_median_gap"] + 0.10) < 1e-12
+    assert abs(result.loc["SPU-1", "purchase_rate_platform_median_gap"] + 0.35) < 1e-12
+    displayed = display_table(result.reset_index())
+    assert displayed.loc[0, "销售额占总销售额占比"] == "25.00%"
+    assert displayed.loc[0, "毛利额-1占总销售额占比"] == "5.00%"
+    spu_1_displayed = displayed.loc[displayed["SPU"].eq("SPU-1")].iloc[0]
+    assert spu_1_displayed["子类目中位数差异（采购成本占比）"] == "-10.00pp"
+    assert spu_1_displayed["平台全品类中位数差异（采购成本占比）"] == "-35.00pp"
+
+
+def test_active_spu_counts_exclude_zero_sales_and_align_grade_breakdown() -> None:
+    active_a = sample_frame().iloc[[0]].copy()
+    active_a["spu"] = "SPU-A-ON"
+    active_a["grade"] = "A"
+    active_a["sales_amount"] = 100.0
+    inactive_a = active_a.copy()
+    inactive_a["spu"] = "SPU-A-OFF"
+    inactive_a["sales_amount"] = 0.0
+    active_c = active_a.copy()
+    active_c["spu"] = "SPU-C-ON"
+    active_c["grade"] = "C-"
+    active_c["sales_amount"] = 50.0
+    frame = pd.concat([active_a, inactive_a, active_c], ignore_index=True)
+
+    counts = active_spu_counts(frame, ["grade"]).set_index("grade")
+    breakdown, _ = build_category_grade_breakdown(frame, "category")
+
+    assert counts.loc["A", "有效SPU数"] == 1
+    assert counts.loc["C-", "有效SPU数"] == 1
+    assert breakdown.loc[breakdown["grade"].eq("A"), "有效SPU数"].iloc[0] == 1
+    assert breakdown.loc[breakdown["grade"].eq("C-"), "有效SPU数"].iloc[0] == 1
 
 
 def test_monthly_analysis_uses_exact_previous_month_and_pp_for_rates() -> None:
@@ -332,3 +393,144 @@ def test_bundled_data_is_default_and_uploaded_year_overrides_it() -> None:
 
     assert set(result.loc[result["source_year"] == 2025, "spu"]) == {"SPU-UPLOADED-2025"}
     assert set(result.loc[result["source_year"] == 2026, "spu"]) == {"SPU-BUNDLED-2026"}
+
+
+def _movement_row(
+    spu: str,
+    grade: str,
+    sales: float,
+    gross_profit: float,
+    platform: str = "Amazon",
+    group: str = "一组",
+) -> pd.DataFrame:
+    row = sample_frame().iloc[[0]].copy()
+    row["spu"] = spu
+    row["grade"] = grade
+    row["platform"] = platform
+    row["group"] = group
+    row["sales_amount"] = sales
+    row["gross_profit_1_raw"] = gross_profit
+    return row
+
+
+def test_c_series_structure_compares_raw_grade_shares() -> None:
+    current = pd.concat(
+        [
+            _movement_row("SPU-S", "S", 100.0, 20.0),
+            _movement_row("SPU-C+", "C+", 40.0, 4.0),
+            _movement_row("SPU-C-", "C-", 60.0, -6.0),
+        ],
+        ignore_index=True,
+    )
+    prior = pd.concat(
+        [
+            _movement_row("SPU-S", "S", 100.0, 20.0),
+            _movement_row("SPU-C+", "C+", 20.0, 2.0),
+        ],
+        ignore_index=True,
+    )
+
+    result = build_c_series_structure(current, prior, "platform").iloc[0]
+    overview = build_c_series_overview(current, prior).iloc[0]
+
+    assert result["本期C系列SPU数"] == 2
+    assert abs(result["本期C系列SPU占比"] - 2 / 3) < 1e-12
+    assert abs(result["本期C系列销售额占比"] - 0.5) < 1e-12
+    assert result["C系列SPU数增减"] == 1
+    assert abs(result["C系列SPU数同比"] - 1.0) < 1e-12
+    assert overview["本期C系列SPU数"] == 2
+    assert abs(overview["本期C系列SPU占比"] - 2 / 3) < 1e-12
+    assert abs(overview["C系列SPU数同比"] - 1.0) < 1e-12
+
+
+def test_c_series_structure_matches_raw_grade_breakdown_for_changed_spu() -> None:
+    current = pd.concat(
+        [
+            _movement_row("SPU-Changed", "C-", 10.0, -1.0),
+            _movement_row("SPU-Changed", "A", 90.0, 9.0),
+            _movement_row("SPU-S", "S", 100.0, 20.0),
+        ],
+        ignore_index=True,
+    )
+    prior = current.iloc[0:0].copy()
+
+    result = build_c_series_structure(current, prior, "platform").iloc[0]
+    overview = build_c_series_overview(current, prior).iloc[0]
+
+    assert result["本期C系列SPU数"] == 1
+    assert abs(result["本期C系列SPU占比"] - 0.5) < 1e-12
+    assert overview["本期C系列SPU数"] == 1
+    assert abs(overview["本期C系列SPU占比"] - 0.5) < 1e-12
+
+
+def test_deteriorated_spu_analysis_only_keeps_current_s_a_b_double_declines() -> None:
+    current = pd.concat(
+        [
+            _movement_row("SPU-A", "A", 80.0, 8.0),
+            _movement_row("SPU-C", "C-", 50.0, -5.0),
+            _movement_row("SPU-UP", "S", 120.0, 30.0),
+        ],
+        ignore_index=True,
+    )
+    prior = pd.concat(
+        [
+            _movement_row("SPU-A", "A", 100.0, 10.0),
+            _movement_row("SPU-C", "C-", 70.0, -2.0),
+            _movement_row("SPU-UP", "S", 100.0, 20.0),
+        ],
+        ignore_index=True,
+    )
+
+    summary, detail = build_deteriorated_spu_analysis(current, prior, "platform")
+
+    assert detail["spu"].tolist() == ["SPU-A"]
+    assert summary.loc[0, "表现变差SPU数"] == 1
+    assert summary.loc[0, "销售额变动"] == -20.0
+    assert summary.loc[0, "毛利额-1变动"] == -2.0
+
+
+def test_improved_spu_analysis_summarizes_all_candidates_and_returns_ranked_top_n() -> None:
+    current = pd.concat(
+        [
+            _movement_row("SPU-1", "A", 150.0, 30.0),
+            _movement_row("SPU-2", "C-", 110.0, 100.0),
+            _movement_row("SPU-3", "新品", 200.0, 40.0),
+        ],
+        ignore_index=True,
+    )
+    prior = pd.concat(
+        [
+            _movement_row("SPU-1", "A", 100.0, 20.0),
+            _movement_row("SPU-2", "C-", 90.0, 70.0),
+            _movement_row("SPU-3", "新品", 190.0, 35.0),
+        ],
+        ignore_index=True,
+    )
+
+    summary, top = build_improved_spu_analysis(current, prior, "platform", top_n=2)
+
+    assert summary.loc[0, "表现变好SPU数"] == 3
+    assert summary.loc[0, "Top入选SPU数"] == 2
+    assert top["spu"].tolist() == ["SPU-1", "SPU-2"]
+    assert top["本期产品分级"].tolist() == ["A", "C-"]
+
+
+def test_confirmed_group_mapping_applies_before_prior_year_comparison() -> None:
+    prior = _movement_row(
+        "SPU-1",
+        "A",
+        100.0,
+        20.0,
+        group="美国第一事业部美亚户外家具运营一部二组",
+    )
+    prior["source_year"] = 2025
+
+    mapped = normalize_group_comparison(prior)
+
+    assert mapped.loc[0, "group"] == "美国第一事业部美亚户外家具运营部一组"
+
+
+def test_c_series_share_change_is_displayed_in_pp() -> None:
+    result = display_table(pd.DataFrame({"C系列销售额占比变化": [0.0123]}))
+
+    assert result.loc[0, "C系列销售额占比变化"] == "+1.23pp"

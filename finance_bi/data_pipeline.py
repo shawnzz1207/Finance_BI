@@ -57,6 +57,8 @@ ANALYSIS_DIMENSIONS = [
 METRIC_LABELS = {
     "sales_amount": "销售额",
     "standard_gross_profit_1": "毛利额-1",
+    "sales_per_active_spu": "品效-销售额",
+    "gross_profit_per_active_spu": "品效-毛利额",
     "gross_margin_1": "毛利率-1",
     "purchase_cost": "采购成本",
     "purchase_rate": "采购成本占比",
@@ -78,6 +80,8 @@ AMOUNT_METRICS = {
     "sales_amount",
     "standard_gross_profit_1",
     "standard_gross_profit_2",
+    "sales_per_active_spu",
+    "gross_profit_per_active_spu",
     "purchase_cost",
     "first_leg_cost",
     "tail_cost",
@@ -95,6 +99,19 @@ RATE_METRICS = {
     "refund_rate",
     "ad_rate",
     "inventory_depreciation_rate",
+}
+
+# 已确认的美亚户外家具组别调整。仅在 2025 数据作为 2026 同期对比时
+# 应用；未列出的名称保留原值，并在归因结果中明确标记为迁入/迁出。
+GROUP_NAME_MAP_2025_TO_2026 = {
+    "美国第一事业部美亚户外家具运营一部一组": "美国第一事业部美亚户外家具运营部一组",
+    "美国第一事业部美亚户外家具运营一部二组": "美国第一事业部美亚户外家具运营部一组",
+    "美国第一事业部美亚户外家具运营一部三组": "美国第一事业部美亚户外家具运营部一组",
+    "美国第一事业部美亚户外家具运营二部一组": "美国第一事业部美亚户外家具运营部六组",
+    "美国第一事业部美亚户外家具运营二部二组": "美国第一事业部美亚户外家具运营部二组",
+    "美国第一事业部美亚户外家具运营二部三组": "美国第一事业部美亚户外家具运营部三组",
+    "美国第一事业部美亚户外家具运营二部四组": "美国第一事业部美亚户外家具运营部四组",
+    "美国第一事业部美亚户外家具运营二部五组": "美国第一事业部美亚户外家具运营部五组",
 }
 
 _NUMERIC_FIELDS = [
@@ -399,7 +416,11 @@ def aggregate_pnl(frame: pd.DataFrame, dimensions: Iterable[str]) -> pd.DataFram
     """Aggregate raw records, then calculate amounts and rates at the requested grain."""
     dimensions = list(dimensions)
     if frame.empty:
-        return calculate_metrics(pd.DataFrame(columns=[*dimensions, *_NUMERIC_FIELDS]))
+        result = calculate_metrics(pd.DataFrame(columns=[*dimensions, *_NUMERIC_FIELDS]))
+        result["有效SPU数"] = pd.Series(dtype="int64")
+        result["sales_per_active_spu"] = pd.Series(dtype="float64")
+        result["gross_profit_per_active_spu"] = pd.Series(dtype="float64")
+        return result
 
     if dimensions:
         aggregated = (
@@ -407,7 +428,51 @@ def aggregate_pnl(frame: pd.DataFrame, dimensions: Iterable[str]) -> pd.DataFram
         )
     else:
         aggregated = pd.DataFrame([frame[_NUMERIC_FIELDS].sum(numeric_only=True)])
-    return calculate_metrics(aggregated)
+    result = calculate_metrics(aggregated)
+    active_counts = active_spu_counts(frame, dimensions)
+    if dimensions:
+        result = result.merge(active_counts, on=dimensions, how="left")
+    else:
+        result["有效SPU数"] = active_counts.loc[0, "有效SPU数"]
+    result["有效SPU数"] = result["有效SPU数"].fillna(0).astype(int)
+    denominator = result["有效SPU数"].where(result["有效SPU数"] > 0)
+    result["sales_per_active_spu"] = result["sales_amount"].div(denominator)
+    result["gross_profit_per_active_spu"] = result["standard_gross_profit_1"].div(
+        denominator
+    )
+    return result
+
+
+def active_spu_counts(frame: pd.DataFrame, dimensions: Iterable[str]) -> pd.DataFrame:
+    """Count unique SPUs with positive selected-period sales at the requested grain.
+
+    This is the eligibility rule used by the SPU diagnostic median population.
+    Keeping it in one helper prevents product-structure tables from counting
+    zero-sales SPUs while diagnostic sample sizes exclude them.
+    """
+    dimensions = list(dimensions)
+    columns = [*dimensions, "有效SPU数"]
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    if not dimensions:
+        per_spu = frame.groupby("spu", as_index=False, dropna=False)["sales_amount"].sum()
+        return pd.DataFrame(
+            {"有效SPU数": [int(per_spu.loc[per_spu["sales_amount"] > 0, "spu"].nunique())]}
+        )
+    spu_dimensions = dimensions if "spu" in dimensions else [*dimensions, "spu"]
+    per_spu = frame.groupby(spu_dimensions, as_index=False, dropna=False)["sales_amount"].sum()
+    active = per_spu.loc[per_spu["sales_amount"] > 0]
+    if active.empty:
+        return pd.DataFrame(columns=columns)
+    if "spu" in dimensions:
+        result = active.loc[:, dimensions].drop_duplicates().copy()
+        result["有效SPU数"] = 1
+        return result
+    return (
+        active.groupby(dimensions, as_index=False, dropna=False)["spu"]
+        .nunique()
+        .rename(columns={"spu": "有效SPU数"})
+    )
 
 
 def build_monthly_metric_analysis(
@@ -534,7 +599,7 @@ def build_monthly_full_metrics(
 
     result = pd.concat(frames, ignore_index=True)
     result = result.sort_values(["_month_order", "_series_order"], kind="stable")
-    columns = ["period", "comparison_period", "spu_count", *METRIC_LABELS]
+    columns = ["period", "comparison_period", "spu_count", "有效SPU数", *METRIC_LABELS]
     return result.loc[:, columns].reset_index(drop=True)
 
 
@@ -597,16 +662,10 @@ def build_category_grade_breakdown(
     if dimension not in {"category", "subcategory"}:
         raise ValueError("类目产品分级分析仅支持大类目或子类目维度")
     if frame.empty:
-        empty = pd.DataFrame(columns=[dimension, "grade", "SPU数", *METRIC_LABELS])
+        empty = pd.DataFrame(columns=[dimension, "grade", "有效SPU数", *METRIC_LABELS])
         return empty, empty.copy()
 
     breakdown = aggregate_pnl(frame, [dimension, "grade"])
-    spu_count = (
-        frame.groupby([dimension, "grade"], as_index=False)["spu"]
-        .nunique()
-        .rename(columns={"spu": "SPU数"})
-    )
-    breakdown = breakdown.merge(spu_count, on=[dimension, "grade"], how="left")
 
     ranked_dimensions = (
         aggregate_pnl(frame, [dimension])
@@ -615,6 +674,322 @@ def build_category_grade_breakdown(
     )
     chart_breakdown = breakdown.loc[breakdown[dimension].isin(ranked_dimensions)].copy()
     return breakdown, chart_breakdown
+
+
+def normalize_group_comparison(frame: pd.DataFrame) -> pd.DataFrame:
+    """Apply confirmed 2025-to-2026 group mappings before group-level filtering."""
+    result = frame.copy()
+    if "source_year" in result.columns:
+        mask = result["source_year"].eq(2025)
+        result.loc[mask, "group"] = result.loc[mask, "group"].replace(
+            GROUP_NAME_MAP_2025_TO_2026
+        )
+    return result
+
+
+def _validate_structure_dimension(dimension: str) -> None:
+    if dimension not in {"platform", "group"}:
+        raise ValueError("产品结构与SPU表现分析仅支持平台或组别维度")
+
+
+def _dominant_grade_spu_profile(
+    frame: pd.DataFrame, dimension: str | None = None
+) -> pd.DataFrame:
+    """Aggregate one SPU per slice and keep its sales-dominant grade.
+
+    With no dimension, the function returns a de-duplicated all-scope SPU view;
+    this is used for top-level cards so multi-platform SPUs are not counted twice.
+    """
+    if dimension is not None:
+        _validate_structure_dimension(dimension)
+    dimensions = [dimension] if dimension else []
+    columns = [
+        *dimensions,
+        "spu",
+        "grade",
+        "sales_amount",
+        "standard_gross_profit_1",
+    ]
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    totals = aggregate_pnl(frame, [*dimensions, "spu"])[
+        [*dimensions, "spu", "sales_amount", "standard_gross_profit_1"]
+    ]
+    grade_sales = aggregate_pnl(frame, [*dimensions, "spu", "grade"])[
+        [*dimensions, "spu", "grade", "sales_amount", "standard_gross_profit_1"]
+    ]
+    dominant_grade = grade_sales.sort_values(
+        [*dimensions, "spu", "sales_amount", "standard_gross_profit_1"],
+        ascending=[True] * (len(dimensions) + 1) + [False, False],
+        kind="stable",
+    ).drop_duplicates([*dimensions, "spu"], keep="first")
+    return totals.merge(
+        dominant_grade[[*dimensions, "spu", "grade"]], on=[*dimensions, "spu"], how="left"
+    ).loc[:, columns]
+
+
+def _c_series_snapshot(frame: pd.DataFrame, dimension: str) -> pd.DataFrame:
+    columns = [dimension, "SPU数", "销售额", "C系列SPU数", "C系列销售额"]
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    # Keep this aggregation identical to the product-grade detail table: a SPU
+    # belongs to the C series when any raw record in the selected period is C+/C-/C--.
+    # This deliberately differs from the SPU movement views, which require one
+    # dominant grade per SPU to identify the current-product grade.
+    overall = frame.groupby(dimension, as_index=False, dropna=False).agg(
+        SPU数=("spu", "nunique"), 销售额=("sales_amount", "sum")
+    )
+    c_series = frame.loc[frame["grade"].astype("string").str.contains("C", na=False)]
+    if c_series.empty:
+        overall["C系列SPU数"] = 0.0
+        overall["C系列销售额"] = 0.0
+        return overall.loc[:, columns]
+    c_summary = c_series.groupby(dimension, as_index=False, dropna=False).agg(
+        C系列SPU数=("spu", "nunique"), C系列销售额=("sales_amount", "sum")
+    )
+    result = overall.merge(c_summary, on=dimension, how="left")
+    result[["C系列SPU数", "C系列销售额"]] = result[
+        ["C系列SPU数", "C系列销售额"]
+    ].fillna(0.0)
+    return result.loc[:, columns]
+
+
+def build_c_series_structure(
+    current_frame: pd.DataFrame, prior_frame: pd.DataFrame, dimension: str
+) -> pd.DataFrame:
+    """Compare C-series (C+, C-, C--) SPU and sales exposure by platform/group."""
+    current = _c_series_snapshot(current_frame, dimension).rename(
+        columns={column: f"本期{column}" for column in ["SPU数", "销售额", "C系列SPU数", "C系列销售额"]}
+    )
+    prior_source = normalize_group_comparison(prior_frame) if dimension == "group" else prior_frame
+    prior = _c_series_snapshot(prior_source, dimension).rename(
+        columns={column: f"去年同期{column}" for column in ["SPU数", "销售额", "C系列SPU数", "C系列销售额"]}
+    )
+    if current.empty and prior.empty:
+        return pd.DataFrame(columns=[dimension])
+    result = current.merge(prior, on=dimension, how="outer", indicator=True)
+    result["同比可比状态"] = result.pop("_merge").map(
+        {"both": "可比", "left_only": "新增/迁入", "right_only": "退出/迁出"}
+    )
+    for column in ["本期SPU数", "本期销售额", "本期C系列SPU数", "本期C系列销售额", "去年同期SPU数", "去年同期销售额", "去年同期C系列SPU数", "去年同期C系列销售额"]:
+        if column not in result:
+            result[column] = pd.NA
+    result["本期C系列SPU占比"] = result["本期C系列SPU数"].div(
+        result["本期SPU数"].where(result["本期SPU数"] != 0)
+    )
+    result["去年同期C系列SPU占比"] = result["去年同期C系列SPU数"].div(
+        result["去年同期SPU数"].where(result["去年同期SPU数"] != 0)
+    )
+    result["本期C系列销售额占比"] = result["本期C系列销售额"].div(
+        result["本期销售额"].where(result["本期销售额"] != 0)
+    )
+    result["去年同期C系列销售额占比"] = result["去年同期C系列销售额"].div(
+        result["去年同期销售额"].where(result["去年同期销售额"] != 0)
+    )
+    result["C系列SPU数增减"] = result["本期C系列SPU数"] - result["去年同期C系列SPU数"]
+    result["C系列SPU数同比"] = result["本期C系列SPU数"].div(
+        result["去年同期C系列SPU数"].where(result["去年同期C系列SPU数"] != 0)
+    ) - 1
+    result["C系列销售额同比"] = result["本期C系列销售额"].div(
+        result["去年同期C系列销售额"].where(result["去年同期C系列销售额"] != 0)
+    ) - 1
+    result["C系列SPU占比变化"] = result["本期C系列SPU占比"] - result["去年同期C系列SPU占比"]
+    result["C系列销售额占比变化"] = result["本期C系列销售额占比"] - result[
+        "去年同期C系列销售额占比"
+    ]
+    return result.sort_values("本期C系列销售额占比", ascending=False, kind="stable").reset_index(drop=True)
+
+
+def _c_series_total_snapshot(frame: pd.DataFrame) -> dict[str, float]:
+    c_series = frame.loc[frame["grade"].astype("string").str.contains("C", na=False)]
+    return {
+        "SPU数": float(frame["spu"].nunique()),
+        "销售额": float(frame["sales_amount"].sum()),
+        "C系列SPU数": float(c_series["spu"].nunique()),
+        "C系列销售额": float(c_series["sales_amount"].sum()),
+    }
+
+
+def build_c_series_overview(current_frame: pd.DataFrame, prior_frame: pd.DataFrame) -> pd.DataFrame:
+    """Return de-duplicated C-series headline metrics for the current filter scope."""
+    current = _c_series_total_snapshot(current_frame)
+    prior = _c_series_total_snapshot(prior_frame)
+    result = pd.DataFrame(
+        [
+            {
+                **{f"本期{key}": value for key, value in current.items()},
+                **{f"去年同期{key}": value for key, value in prior.items()},
+            }
+        ]
+    )
+    result["本期C系列SPU占比"] = result["本期C系列SPU数"].div(
+        result["本期SPU数"].where(result["本期SPU数"] != 0)
+    )
+    result["去年同期C系列SPU占比"] = result["去年同期C系列SPU数"].div(
+        result["去年同期SPU数"].where(result["去年同期SPU数"] != 0)
+    )
+    result["本期C系列销售额占比"] = result["本期C系列销售额"].div(
+        result["本期销售额"].where(result["本期销售额"] != 0)
+    )
+    result["去年同期C系列销售额占比"] = result["去年同期C系列销售额"].div(
+        result["去年同期销售额"].where(result["去年同期销售额"] != 0)
+    )
+    result["C系列SPU数增减"] = result["本期C系列SPU数"] - result["去年同期C系列SPU数"]
+    result["C系列SPU数同比"] = result["本期C系列SPU数"].div(
+        result["去年同期C系列SPU数"].where(result["去年同期C系列SPU数"] != 0)
+    ) - 1
+    result["C系列销售额同比"] = result["本期C系列销售额"].div(
+        result["去年同期C系列销售额"].where(result["去年同期C系列销售额"] != 0)
+    ) - 1
+    result["C系列SPU占比变化"] = result["本期C系列SPU占比"] - result["去年同期C系列SPU占比"]
+    result["C系列销售额占比变化"] = result["本期C系列销售额占比"] - result[
+        "去年同期C系列销售额占比"
+    ]
+    return result
+
+
+def _spu_yoy_profile(
+    current_frame: pd.DataFrame, prior_frame: pd.DataFrame, dimension: str
+) -> pd.DataFrame:
+    """Return comparable SPU-level sales and gross-profit changes at one slice."""
+    _validate_structure_dimension(dimension)
+    current = _dominant_grade_spu_profile(current_frame, dimension).rename(
+        columns={
+            "grade": "本期产品分级",
+            "sales_amount": "本期销售额",
+            "standard_gross_profit_1": "本期毛利额-1",
+        }
+    )
+    prior_source = normalize_group_comparison(prior_frame) if dimension == "group" else prior_frame
+    prior = _dominant_grade_spu_profile(prior_source, dimension).rename(
+        columns={
+            "grade": "去年同期产品分级",
+            "sales_amount": "去年同期销售额",
+            "standard_gross_profit_1": "去年同期毛利额-1",
+        }
+    )
+    if current.empty and prior.empty:
+        return pd.DataFrame(columns=[dimension, "spu"])
+    result = current.merge(prior, on=[dimension, "spu"], how="outer", indicator=True)
+    result["SPU状态"] = result.pop("_merge").map(
+        {"both": "存量", "left_only": "新增/迁入", "right_only": "退出/迁出"}
+    )
+    result["销售额变动"] = result["本期销售额"].fillna(0.0) - result["去年同期销售额"].fillna(0.0)
+    result["毛利额-1变动"] = result["本期毛利额-1"].fillna(0.0) - result[
+        "去年同期毛利额-1"
+    ].fillna(0.0)
+    result["销售额同比"] = result["本期销售额"].div(
+        result["去年同期销售额"].where(result["去年同期销售额"] != 0)
+    ) - 1
+    result["毛利额-1同比"] = result["本期毛利额-1"].div(
+        result["去年同期毛利额-1"].where(result["去年同期毛利额-1"] != 0)
+    ) - 1
+    return result
+
+
+def _summarize_spu_movement(detail: pd.DataFrame, dimension: str, label: str) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame(
+            columns=[
+                dimension,
+                f"{label}SPU数",
+                "本期销售额",
+                "去年同期销售额",
+                "销售额变动",
+                "销售额同比",
+                "本期毛利额-1",
+                "去年同期毛利额-1",
+                "毛利额-1变动",
+                "毛利额-1同比",
+            ]
+        )
+    result = detail.groupby(dimension, as_index=False, dropna=False).agg(
+        **{
+            f"{label}SPU数": ("spu", "nunique"),
+            "本期销售额": ("本期销售额", "sum"),
+            "去年同期销售额": ("去年同期销售额", "sum"),
+            "销售额变动": ("销售额变动", "sum"),
+            "本期毛利额-1": ("本期毛利额-1", "sum"),
+            "去年同期毛利额-1": ("去年同期毛利额-1", "sum"),
+            "毛利额-1变动": ("毛利额-1变动", "sum"),
+        }
+    )
+    result["销售额同比"] = result["本期销售额"].div(
+        result["去年同期销售额"].where(result["去年同期销售额"] != 0)
+    ) - 1
+    result["毛利额-1同比"] = result["本期毛利额-1"].div(
+        result["去年同期毛利额-1"].where(result["去年同期毛利额-1"] != 0)
+    ) - 1
+    return result
+
+
+def build_deteriorated_spu_analysis(
+    current_frame: pd.DataFrame, prior_frame: pd.DataFrame, dimension: str
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Find persistent current S/A/B SPUs whose sales and gross profit both declined."""
+    profile = _spu_yoy_profile(current_frame, prior_frame, dimension)
+    detail = profile.loc[
+        profile["SPU状态"].eq("存量")
+        & profile["本期产品分级"].isin({"S", "A", "B"})
+        & profile["销售额变动"].lt(0)
+        & profile["毛利额-1变动"].lt(0)
+    ].copy()
+    if detail.empty:
+        return _summarize_spu_movement(detail, dimension, "表现变差"), detail
+    detail["下降优先级"] = (
+        detail["销售额变动"].abs().rank(method="min", ascending=False)
+        + detail["毛利额-1变动"].abs().rank(method="min", ascending=False)
+    )
+    detail = detail.sort_values(
+        ["下降优先级", "销售额变动", "毛利额-1变动"],
+        ascending=[True, True, True],
+        kind="stable",
+    ).reset_index(drop=True)
+    return _summarize_spu_movement(detail, dimension, "表现变差"), detail
+
+
+def build_improved_spu_analysis(
+    current_frame: pd.DataFrame,
+    prior_frame: pd.DataFrame,
+    dimension: str,
+    top_n: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the Top-N persistent SPUs with positive absolute sales and profit growth."""
+    profile = _spu_yoy_profile(current_frame, prior_frame, dimension)
+    candidates = profile.loc[
+        profile["SPU状态"].eq("存量")
+        & profile["销售额变动"].gt(0)
+        & profile["毛利额-1变动"].gt(0)
+    ].copy()
+    if candidates.empty:
+        return _summarize_spu_movement(candidates, dimension, "表现变好"), candidates
+    candidates["销售额增长排名"] = candidates["销售额变动"].rank(
+        method="min", ascending=False
+    )
+    candidates["毛利额-1增长排名"] = candidates["毛利额-1变动"].rank(
+        method="min", ascending=False
+    )
+    candidates["综合增长排名"] = (
+        candidates["销售额增长排名"] + candidates["毛利额-1增长排名"]
+    )
+    top = candidates.sort_values(
+        ["综合增长排名", "销售额变动", "毛利额-1变动"],
+        ascending=[True, False, False],
+        kind="stable",
+    ).head(max(int(top_n), 1)).reset_index(drop=True)
+    top["全局增长排名"] = range(1, len(top) + 1)
+    summary = _summarize_spu_movement(candidates, dimension, "表现变好")
+    top_summary = top.groupby(dimension, as_index=False, dropna=False).agg(
+        **{
+            "Top入选SPU数": ("spu", "nunique"),
+            "Top销售额增长": ("销售额变动", "sum"),
+            "Top毛利额-1增长": ("毛利额-1变动", "sum"),
+        }
+    )
+    summary = summary.merge(top_summary, on=dimension, how="left")
+    for column in ["Top入选SPU数", "Top销售额增长", "Top毛利额-1增长"]:
+        summary[column] = pd.to_numeric(summary[column], errors="coerce").fillna(0.0)
+    return summary.sort_values("销售额变动", ascending=False, kind="stable").reset_index(drop=True), top
 
 
 def build_spu_benchmarks(selected_frame: pd.DataFrame, population_frame: pd.DataFrame) -> pd.DataFrame:
@@ -626,6 +1001,12 @@ def build_spu_benchmarks(selected_frame: pd.DataFrame, population_frame: pd.Data
     """
     detail_dimensions = ["platform", "category", "subcategory", "grade", "spu"]
     selected = aggregate_pnl(selected_frame, detail_dimensions)
+    total_sales = selected["sales_amount"].sum()
+    denominator = total_sales if total_sales != 0 else pd.NA
+    selected["sales_share_of_total_sales"] = selected["sales_amount"].div(denominator)
+    selected["gross_profit_share_of_total_sales"] = selected[
+        "standard_gross_profit_1"
+    ].div(denominator)
     population = aggregate_pnl(population_frame, detail_dimensions)
     population = population.loc[population["sales_amount"] > 0].copy()
 
@@ -664,6 +1045,24 @@ def build_spu_benchmarks(selected_frame: pd.DataFrame, population_frame: pd.Data
         on=["platform", "category", "subcategory"],
         how="left",
     )
+    return result
+
+
+def add_spu_benchmark_deltas(frame: pd.DataFrame, metrics: Sequence[str]) -> pd.DataFrame:
+    """Add selected SPU cost-rate deviations from the two benchmark baselines.
+
+    The result remains one row per SPU. Each selected cost rate receives its own
+    subcategory and platform median deviation column, allowing the UI to place
+    several cost-rate comparisons side by side in one diagnostic table.
+    """
+    result = frame.copy()
+    for metric in metrics:
+        subcategory_median = f"subcategory_median_{metric}"
+        platform_median = f"platform_median_{metric}"
+        if metric not in result or subcategory_median not in result or platform_median not in result:
+            raise KeyError(f"SPU费用率对标缺少字段：{metric}")
+        result[f"{metric}_subcategory_median_gap"] = result[metric] - result[subcategory_median]
+        result[f"{metric}_platform_median_gap"] = result[metric] - result[platform_median]
     return result
 
 

@@ -84,7 +84,9 @@ def chinese_headers(frame: pd.DataFrame) -> pd.DataFrame:
         "period_label": "期间",
         "comparison_period": "数据期间",
         "spu_count": "SPU数",
-        "subcategory_spu_sample": "子类目SPU样本数",
+        "subcategory_spu_sample": "子类目有效SPU样本数（销售额>0）",
+        "sales_share_of_total_sales": "销售额占总销售额占比",
+        "gross_profit_share_of_total_sales": "毛利额-1占总销售额占比",
         "platform_income": "平台收入",
         "platform_expense": "平台支出",
         "purchase_cost_raw": "采购成本源值",
@@ -121,6 +123,8 @@ def chinese_headers(frame: pd.DataFrame) -> pd.DataFrame:
         labels[f"{metric_key}_上月"] = f"上月{metric_label}"
         labels[f"subcategory_median_{metric_key}"] = f"子类目中位数（{metric_label}）"
         labels[f"platform_median_{metric_key}"] = f"平台全品类中位数（{metric_label}）"
+        labels[f"{metric_key}_subcategory_median_gap"] = f"子类目中位数差异（{metric_label}）"
+        labels[f"{metric_key}_platform_median_gap"] = f"平台全品类中位数差异（{metric_label}）"
     return frame.rename(columns=labels)
 
 
@@ -150,7 +154,7 @@ def display_table(frame: pd.DataFrame, missing_as_dash: bool = False) -> pd.Data
         )
         if not is_rate:
             continue
-        if any(token in str(display_column) for token in ("中位数差异", "同比变化", "环比变化")):
+        if any(token in str(display_column) for token in ("中位数差异", "同比变化", "环比变化", "占比变化")):
             displayed[display_column] = displayed[display_column].map(pp)
         elif any(token in str(display_column) for token in ("同比", "环比")):
             displayed[display_column] = displayed[display_column].map(
