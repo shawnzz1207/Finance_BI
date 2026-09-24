@@ -86,7 +86,7 @@ def chinese_headers(frame: pd.DataFrame) -> pd.DataFrame:
         "spu_count": "SPU数",
         "subcategory_spu_sample": "子类目有效SPU样本数（销售额>0）",
         "sales_share_of_total_sales": "销售额占总销售额占比",
-        "gross_profit_share_of_total_sales": "毛利额-1占总销售额占比",
+        "gross_profit_share_of_total_profit": "毛利额-1占总毛利额占比",
         "platform_income": "平台收入",
         "platform_expense": "平台支出",
         "purchase_cost_raw": "采购成本源值",

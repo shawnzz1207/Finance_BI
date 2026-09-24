@@ -152,7 +152,9 @@ def test_spu_benchmarks_separate_subcategories() -> None:
     assert result.loc["SPU-1", "subcategory_spu_sample"] == 2
     assert result.loc["SPU-3", "subcategory_spu_sample"] == 2
     assert abs(result.loc["SPU-1", "sales_share_of_total_sales"] - 0.25) < 1e-12
-    assert abs(result.loc["SPU-1", "gross_profit_share_of_total_sales"] - 0.05) < 1e-12
+    assert abs(result.loc["SPU-1", "gross_profit_share_of_total_profit"] - 0.25) < 1e-12
+    assert abs(result["sales_share_of_total_sales"].sum() - 1) < 1e-12
+    assert abs(result["gross_profit_share_of_total_profit"].sum() - 1) < 1e-12
     result = add_spu_benchmark_deltas(
         result.reset_index(),
         ["purchase_rate", "first_leg_rate"],
@@ -161,10 +163,41 @@ def test_spu_benchmarks_separate_subcategories() -> None:
     assert abs(result.loc["SPU-1", "purchase_rate_platform_median_gap"] + 0.35) < 1e-12
     displayed = display_table(result.reset_index())
     assert displayed.loc[0, "销售额占总销售额占比"] == "25.00%"
-    assert displayed.loc[0, "毛利额-1占总销售额占比"] == "5.00%"
+    assert displayed.loc[0, "毛利额-1占总毛利额占比"] == "25.00%"
     spu_1_displayed = displayed.loc[displayed["SPU"].eq("SPU-1")].iloc[0]
     assert spu_1_displayed["子类目中位数差异（采购成本占比）"] == "-10.00pp"
     assert spu_1_displayed["平台全品类中位数差异（采购成本占比）"] == "-35.00pp"
+
+
+def test_spu_contribution_shares_use_selected_sales_and_profit_totals() -> None:
+    base = sample_frame().iloc[[0]].copy()
+    rows = []
+    for spu, sales, profit in [
+        ("SPU-A", 100.0, 50.0),
+        ("SPU-B", 300.0, -10.0),
+        ("SPU-C", 600.0, 60.0),
+    ]:
+        row = base.copy()
+        row["spu"] = spu
+        row["sales_amount"] = sales
+        row["gross_profit_1_raw"] = profit
+        rows.append(row)
+    population = pd.concat(rows, ignore_index=True)
+    selected = population.loc[population["spu"].isin(["SPU-A", "SPU-B"])]
+
+    result = build_spu_benchmarks(selected, population).set_index("spu")
+
+    assert abs(result.loc["SPU-A", "sales_share_of_total_sales"] - 0.25) < 1e-12
+    assert abs(result.loc["SPU-A", "gross_profit_share_of_total_profit"] - 1.25) < 1e-12
+    assert abs(result.loc["SPU-B", "gross_profit_share_of_total_profit"] + 0.25) < 1e-12
+    assert abs(result["sales_share_of_total_sales"].sum() - 1) < 1e-12
+    assert abs(result["gross_profit_share_of_total_profit"].sum() - 1) < 1e-12
+    assert "gross_profit_share_of_total_sales" not in result.columns
+
+    zero_profit = selected.copy()
+    zero_profit.loc[zero_profit["spu"].eq("SPU-B"), "gross_profit_1_raw"] = -50.0
+    zero_result = build_spu_benchmarks(zero_profit, population)
+    assert zero_result["gross_profit_share_of_total_profit"].isna().all()
 
 
 def test_active_spu_counts_exclude_zero_sales_and_align_grade_breakdown() -> None:

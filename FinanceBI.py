@@ -6,6 +6,7 @@ Run with: python3 -m streamlit run FinanceBI.py
 from __future__ import annotations
 
 from pathlib import Path
+from math import isfinite
 
 import pandas as pd
 import plotly.express as px
@@ -85,7 +86,7 @@ DEFAULT_OVERVIEW_CARD_LABELS = [
     "退款费用占比",
     "广告费占比",
 ]
-DATA_MODEL_VERSION = "2026-08-category-grade-bundled-v2"
+DATA_MODEL_VERSION = "2026-09-category-grade-bundled-profit-layout-v3"
 MONTHLY_SERIES_COLORS = [
     COLORS["blue"],
     COLORS["gold"],
@@ -115,8 +116,15 @@ def inject_css() -> None:
         :root { --ink:#172033; --muted:#667085; --line:#E6EAF0; --blue:#315EFB; }
         .stApp { background: #F6F7FB; color: var(--ink); }
         [data-testid="stSidebar"] { background: #FFFFFF; border-right: 1px solid #E6EAF0; }
-        [data-testid="stSidebar"] > div:first-child { padding-top: 1.3rem; }
-        .block-container { max-width: 1580px; padding: 1.7rem 2.2rem 3rem; }
+        /* Streamlit Cloud 的顶栏为绝对定位；主区与侧栏均需为其预留空间，
+           否则导入提示、错误信息的首行会被顶栏遮住。 */
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: calc(60px + 1.3rem);
+        }
+        .block-container {
+            max-width: 1580px;
+            padding: calc(60px + 1.7rem) 2.2rem 3rem;
+        }
         h1, h2, h3 { color: #172033 !important; letter-spacing: -0.02em; }
         h2 { font-size: 1.25rem !important; margin-top: .35rem !important; }
         .hero {
@@ -159,6 +167,26 @@ def inject_css() -> None:
         .filter-caption { color:#667085; font-size:.76rem; margin-top:-.35rem; }
         .data-status { background:#FFFFFF; border:1px solid #E7EBF2; border-radius:12px; padding:.75rem 1rem; }
         [data-testid="stDownloadButton"] button { border-radius:8px; }
+        div[class*="st-key-chart_shell_"] { position:relative; }
+        div[class*="st-key-chart_shell_"] div[class*="st-key-chart_switch_trigger_"] {
+            position:absolute; top:.65rem; right:.8rem; z-index:10;
+        }
+        div[class*="st-key-chart_switch_trigger_"] button,
+        div[class*="st-key-chart_switch_choice_"] button {
+            width:1.85rem; min-width:1.85rem; height:1.85rem; min-height:1.85rem;
+            padding:.25rem; color:#98A2B3; background:#F8FAFC;
+            border:1px solid #E4E7EC; border-radius:7px;
+        }
+        div[class*="st-key-chart_switch_trigger_"] button:hover,
+        div[class*="st-key-chart_switch_choice_"] button:hover {
+            color:#667085; background:#F2F4F7; border-color:#CDD5DF;
+        }
+        div[class*="st-key-chart_switch_trigger_"] button [aria-hidden="true"] { display:none; }
+        div[class*="st-key-chart_switch_trigger_"] button p,
+        div[class*="st-key-chart_switch_choice_"] button p {
+            position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+            overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -226,6 +254,7 @@ def source_uploaders() -> tuple[object | None, object | None]:
                 help="上传后替代系统默认的 2026 数据源，不会修改原文件。",
             )
             st.caption("系统默认加载内置的2025、2026数据；上传某一年度后，将直接覆盖该年度的内置数据。")
+            st.caption("2026 年支持 H1 含毛利率列和 1–8 月不含毛利率列两种结构，无需手工补列。")
         st.markdown("---")
     return upload_2025, upload_2026
 
@@ -358,6 +387,201 @@ def metric_delta(current: pd.DataFrame, previous: pd.DataFrame, key: str, is_rat
     if previous_value == 0:
         return None
     return yoy(current_value / previous_value - 1)
+
+
+def pie_chart_data(frame: pd.DataFrame, label: str, value: str, max_slices: int = 8) -> pd.DataFrame | None:
+    """Keep the complete denominator when grouping smaller categories into '其他'."""
+    if frame.empty or label not in frame or value not in frame:
+        return None
+    values = pd.to_numeric(frame[value], errors="coerce")
+    if values.isna().any() or not values.map(isfinite).all() or (values < 0).any() or values.sum() <= 0:
+        return None
+    ordered = (
+        frame.assign(_value=values)
+        .groupby(label, as_index=False, dropna=False)["_value"]
+        .sum()
+        .sort_values("_value", ascending=False, kind="stable")
+    )
+    ordered[label] = ordered[label].fillna("未归属").astype(str)
+    if len(ordered) > max_slices:
+        shown = ordered.head(max_slices).copy()
+        remainder = ordered.iloc[max_slices:]["_value"].sum()
+        other_label = "其他类别"
+        while other_label in set(ordered[label]):
+            other_label += "（汇总）"
+        shown = pd.concat(
+            [shown, pd.DataFrame([{label: other_label, "_value": remainder}])],
+            ignore_index=True,
+        )
+        ordered = shown
+    return ordered
+
+
+def pie_figure(frame: pd.DataFrame, label: str, title: str) -> go.Figure:
+    fig = px.pie(
+        frame,
+        names=label,
+        values="_value",
+        hole=0.48,
+        color_discrete_sequence=MONTHLY_SERIES_COLORS,
+    )
+    fig.update_traces(
+        textinfo="percent",
+        textposition="outside",
+        hovertemplate=f"{DIMENSION_LABELS.get(label, label)}=%{{label}}<br>金额=%{{value:,.2f}}<br>占比=%{{percent:.2%}}<extra></extra>",
+    )
+    fig.update_layout(title={"text": title, "font": {"size": 14}})
+    fig = style_figure(fig, height=440, show_legend=True)
+    fig.update_layout(margin={"l": 32, "r": 32, "t": 54, "b": 32})
+    return fig
+
+
+def dot_figure(figure: go.Figure) -> go.Figure:
+    """Switch a single categorical bar series to markers without changing values."""
+    result = go.Figure()
+    for trace in figure.data:
+        result.add_trace(
+            go.Scatter(
+                x=trace.x,
+                y=trace.y,
+                mode="markers+text",
+                marker={"size": 11, "color": trace.marker.color or COLORS["blue"]},
+                text=trace.text,
+                textposition="top center",
+                customdata=trace.customdata,
+                hovertemplate=trace.hovertemplate,
+                name=trace.name,
+                showlegend=False,
+            )
+        )
+    result.update_layout(figure.layout)
+    return result
+
+
+def column_figure(figure: go.Figure) -> go.Figure:
+    """Show an existing time-series line chart as grouped monthly columns."""
+    result = go.Figure()
+    for trace in figure.data:
+        result.add_trace(
+            go.Bar(
+                x=trace.x,
+                y=trace.y,
+                text=trace.text,
+                textposition="outside",
+                name=trace.name,
+                marker_color=trace.line.color,
+                hovertemplate=trace.hovertemplate,
+                cliponaxis=False,
+            )
+        )
+    result.update_layout(figure.layout)
+    result.update_layout(barmode="group")
+    return result
+
+
+def categorical_heatmap_figure(figure: go.Figure) -> go.Figure:
+    """Compare multiple bar series on the same categorical axis."""
+    categories = list(dict.fromkeys(str(item) for trace in figure.data for item in trace.y))
+    series = [str(trace.name) for trace in figure.data]
+    values = [
+        {str(category): float(value) for category, value in zip(trace.y, trace.x)}
+        for trace in figure.data
+    ]
+    z = [[series_values.get(category) for series_values in values] for category in categories]
+    has_negative = any(value is not None and value < 0 for row in z for value in row)
+    is_rate = "%" in str(figure.layout.xaxis.tickformat or "")
+    text = [
+        ["—" if value is None else (rate(value) if is_rate else amount(value)) for value in row]
+        for row in z
+    ]
+    fig = go.Figure(
+        go.Heatmap(
+            x=series,
+            y=categories,
+            z=z,
+            text=text,
+            texttemplate="%{text}",
+            hovertemplate="分析对象=%{y}<br>系列=%{x}<br>指标值=%{text}<extra></extra>",
+            colorscale="RdBu" if has_negative else "Blues",
+            zmid=0 if has_negative else None,
+            colorbar={"title": "指标值"},
+        )
+    )
+    fig.update_layout(title=figure.layout.title, xaxis_title="系列", yaxis_title="分析对象")
+    fig.update_yaxes(autorange="reversed", automargin=True)
+    fig = style_figure(fig, height=max(380, min(760, 30 * len(categories) + 130)))
+    fig.update_layout(margin={"l": 18, "r": 48, "t": 54, "b": 30})
+    return fig
+
+
+def render_switchable_chart(
+    figure: go.Figure,
+    key: str,
+    *,
+    timeline: bool = False,
+    pie_data: pd.DataFrame | None = None,
+    pie_label: str | None = None,
+    pie_value: str | None = None,
+) -> None:
+    """Offer only chart types supported by the current data and chart geometry."""
+    choices = ["折线图", "柱状图"] if timeline else ["柱状图"]
+    if not timeline and len(figure.data) == 1 and isinstance(figure.data[0], go.Bar):
+        choices.append("点图")
+    if not timeline and len(figure.data) > 1 and all(
+        isinstance(trace, go.Bar) and trace.orientation == "h" for trace in figure.data
+    ):
+        choices.append("热力图")
+    pie_view = (
+        pie_chart_data(pie_data, pie_label, pie_value)
+        if pie_data is not None and pie_label is not None and pie_value is not None
+        else None
+    )
+    if pie_view is not None:
+        choices.append("饼图")
+    if len(choices) == 1:
+        st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+        return
+    widget_key = f"chart_type_{key}"
+    if st.session_state.get(widget_key) not in choices:
+        st.session_state[widget_key] = choices[0]
+    chart_icons = {
+        "柱状图": ":material/bar_chart:",
+        "折线图": ":material/show_chart:",
+        "饼图": ":material/pie_chart:",
+        "点图": ":material/scatter_plot:",
+        "热力图": ":material/grid_view:",
+    }
+    with st.container(key=f"chart_shell_{key}"):
+        with st.popover(
+            "切换图表类型",
+            icon=chart_icons["柱状图"],
+            help="切换图表类型",
+            key=f"chart_switch_trigger_{key}",
+            width="content",
+        ):
+            option_columns = st.columns(len(choices), gap="small")
+            for option_column, option in zip(option_columns, choices):
+                with option_column:
+                    if st.button(
+                        option,
+                        icon=chart_icons[option],
+                        help=f"{option}{'（当前）' if option == st.session_state[widget_key] else ''}",
+                        key=f"chart_switch_choice_{key}_{option}",
+                    ):
+                        st.session_state[widget_key] = option
+                        st.rerun()
+        choice = st.session_state[widget_key]
+        if choice == "饼图":
+            figure = pie_figure(pie_view, pie_label, figure.layout.title.text or "构成占比")
+        elif choice == "点图":
+            figure = dot_figure(figure)
+        elif choice == "热力图":
+            figure = categorical_heatmap_figure(figure)
+        elif choice == "柱状图" and timeline:
+            figure = column_figure(figure)
+        st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+        if choice == "饼图" and pie_data[pie_label].nunique() > 8:
+            st.caption("饼图显示前 8 类，其余合并为“其他类别”；占比以当前筛选范围的全部类别为分母。")
 
 
 def bar_figure(
@@ -659,10 +883,9 @@ def render_yoy_comparison(
     if comparison.empty:
         return
     st.markdown(f"#### {heading}")
-    st.plotly_chart(
+    render_switchable_chart(
         period_comparison_figure(comparison, current, prior, dimensions, metric, heading, top_n),
-        width="stretch",
-        config={"displayModeBar": False},
+        f"yoy_{'_'.join(dimensions)}_{metric}",
     )
     if show_table:
         metric_label = METRIC_LABELS.get(metric, metric)
@@ -774,7 +997,7 @@ def render_cost_rate_change(
     fig = style_figure(fig, height=430, show_legend=True)
     fig.add_vline(x=0, line_width=1, line_color=COLORS["line"])
     fig.update_layout(margin={"l": 14, "r": 100, "t": 52, "b": 24})
-    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    render_switchable_chart(fig, f"cost_rate_change_{rate_metric}")
 
     table_columns = ["spu", "状态", current_column, prior_column, change_column]
     table = comparison.loc[:, table_columns].sort_values(change_column, ascending=False)
@@ -809,10 +1032,10 @@ def render_overview_metric_detail(
         "<p class='section-note'>点击其他指标卡可直接切换；再次点击当前指标卡可收起明细。</p>",
         unsafe_allow_html=True,
     )
-    st.plotly_chart(
+    render_switchable_chart(
         overview_monthly_detail_figure(detail, metric, year, prior_year),
-        width="stretch",
-        config={"displayModeBar": False},
+        f"overview_monthly_detail_{metric}",
+        timeline=True,
     )
     st.dataframe(
         display_table(detail, missing_as_dash=True),
@@ -977,7 +1200,7 @@ def cost_top10_section(current: pd.DataFrame, prior: pd.DataFrame) -> None:
     )
     fig = style_figure(fig, height=430)
     fig.update_layout(margin={"l": 14, "r": 150, "t": 52, "b": 24})
-    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    render_switchable_chart(fig, f"cost_top10_{amount_metric}_{sort_basis}")
 
     table = top[["spu", amount_metric, rate_metric]].sort_values(sort_metric, ascending=False)
     st.dataframe(display_table(table), width="stretch", hide_index=True, height=285)
@@ -999,18 +1222,18 @@ def overview_page(current: pd.DataFrame, prior: pd.DataFrame, year: int, yoy_ena
     st.markdown("#### 经营走势")
     left, right = st.columns(2)
     with left:
-        st.plotly_chart(
+        render_switchable_chart(
             trend_figure(current, prior if yoy_enabled else pd.DataFrame(), "sales_amount", "销售额走势"),
-            width="stretch",
-            config={"displayModeBar": False},
+            "overview_sales_trend",
+            timeline=True,
         )
     with right:
-        st.plotly_chart(
+        render_switchable_chart(
             trend_figure(
                 current, prior if yoy_enabled else pd.DataFrame(), "standard_gross_profit_1", "毛利额-1走势"
             ),
-            width="stretch",
-            config={"displayModeBar": False},
+            "overview_profit_trend",
+            timeline=True,
         )
 
     render_monthly_full_metrics(current, prior, yoy_enabled)
@@ -1031,10 +1254,12 @@ def overview_page(current: pd.DataFrame, prior: pd.DataFrame, year: int, yoy_ena
             )
         else:
             platform_figure = bar_figure(platform, "platform", "sales_amount", "各平台销售额")
-        st.plotly_chart(
+        render_switchable_chart(
             platform_figure,
-            width="stretch",
-            config={"displayModeBar": False},
+            "overview_platform_sales",
+            pie_data=platform if prior.empty else None,
+            pie_label="platform",
+            pie_value="sales_amount",
         )
     with right:
         group = aggregate_pnl(current, ["group"])
@@ -1054,10 +1279,12 @@ def overview_page(current: pd.DataFrame, prior: pd.DataFrame, year: int, yoy_ena
             group_figure = bar_figure(
                 group, "group", "standard_gross_profit_1", "各组别毛利额-1", COLORS["gold"]
             )
-        st.plotly_chart(
+        render_switchable_chart(
             group_figure,
-            width="stretch",
-            config={"displayModeBar": False},
+            "overview_group_profit",
+            pie_data=group if prior.empty else None,
+            pie_label="group",
+            pie_value="standard_gross_profit_1",
         )
     cost_top10_section(current, prior if yoy_enabled else pd.DataFrame())
 
@@ -1145,7 +1372,16 @@ def free_analysis_page(
             fig.update_layout(margin={"l": 14, "r": 90, "t": 54, "b": 24})
         else:
             fig = bar_figure(view, primary, metric, f"按 {primary_label} 查看 {metric_label}")
-    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    pie_metrics = {"sales_amount", "purchase_cost", "first_leg_cost", "tail_cost", "storage_cost", "refund_cost", "ad_cost", "inventory_depreciation"}
+    pie_frame = aggregate_pnl(current, dimensions) if display_mode == "汇总" and not secondary and metric in pie_metrics else None
+    render_switchable_chart(
+        fig,
+        "free_analysis",
+        timeline=display_mode == "月度",
+        pie_data=pie_frame,
+        pie_label=primary if pie_frame is not None else None,
+        pie_value=metric if pie_frame is not None else None,
+    )
 
     previous_column = f"{metric}_上月"
     mom_column = f"{metric_label}环比变化" if metric in RATE_METRICS else f"{metric_label}环比"
@@ -1290,7 +1526,7 @@ def spu_page(
         "sales_amount",
         "sales_share_of_total_sales",
         "standard_gross_profit_1",
-        "gross_profit_share_of_total_sales",
+        "gross_profit_share_of_total_profit",
         "gross_margin_1",
         "subcategory_spu_sample",
     ]
@@ -1304,13 +1540,20 @@ def spu_page(
                 f"{metric}_platform_median_gap",
             ]
         )
-    table = view.loc[:, display_columns].sort_values("sales_amount", ascending=False).head(150)
+    table = view.loc[:, display_columns].sort_values("sales_amount", ascending=False)
     st.markdown(f"#### SPU费用率对标明细 · {len(selected_metrics)}项费用率")
+    total_sales = view["sales_amount"].sum()
+    total_profit = view["standard_gross_profit_1"].sum()
+    st.caption(
+        f"当前筛选范围共 {len(view)} 行SPU明细；"
+        f"销售额占比合计：{rate(view['sales_share_of_total_sales'].sum()) if total_sales != 0 else '—'}；"
+        f"毛利额占比合计：{rate(view['gross_profit_share_of_total_profit'].sum()) if total_profit != 0 else '—'}。"
+        "表格可滚动查看全部明细；亏损SPU的毛利占比为负值，总毛利额为零时不计算毛利占比。"
+    )
     st.dataframe(display_table(table), width="stretch", hide_index=True, height=420)
-    export_table = view.loc[:, display_columns].sort_values("sales_amount", ascending=False)
     st.download_button(
         "导出 SPU 诊断结果（CSV）",
-        data=chinese_headers(export_table).to_csv(index=False).encode("utf-8-sig"),
+        data=chinese_headers(table).to_csv(index=False).encode("utf-8-sig"),
         file_name="spu_finance_diagnosis.csv",
         mime="text/csv",
     )
@@ -1468,7 +1711,7 @@ def product_structure_health_section(
         st.caption("顶部指标卡按当前筛选范围去重 SPU 计算；下方明细按所选平台或组别切片展示。C 系列指 C+、C-、C--，统计规则与“产品分级”明细表一致：所选期间内曾归为 C 系列的 SPU 计入 C 系列。占比变化以 pp 表示。")
         left, right = st.columns(2)
         with left:
-            st.plotly_chart(
+            render_switchable_chart(
                 structure_bar_figure(
                     structure,
                     dimension,
@@ -1478,11 +1721,10 @@ def product_structure_health_section(
                     "rate",
                     COLORS["orange"],
                 ),
-                width="stretch",
-                config={"displayModeBar": False},
+                f"health_c_sales_share_{dimension}",
             )
         with right:
-            st.plotly_chart(
+            render_switchable_chart(
                 structure_bar_figure(
                     structure,
                     dimension,
@@ -1492,8 +1734,7 @@ def product_structure_health_section(
                     "rate",
                     COLORS["gold"],
                 ),
-                width="stretch",
-                config={"displayModeBar": False},
+                f"health_c_spu_share_{dimension}",
             )
         structure_columns = [
             dimension,
@@ -1541,7 +1782,7 @@ def product_structure_health_section(
         st.caption("仅纳入本期分级为 S/A/B 的存量SPU，且销售额、毛利额-1均低于去年同期；“下降优先级”同时考虑两项绝对降幅。")
         left, right = st.columns(2)
         with left:
-            st.plotly_chart(
+            render_switchable_chart(
                 structure_bar_figure(
                     summary,
                     dimension,
@@ -1551,13 +1792,12 @@ def product_structure_health_section(
                     "rate",
                     COLORS["orange"],
                 ),
-                width="stretch",
-                config={"displayModeBar": False},
+                f"health_decline_sales_yoy_{dimension}",
             )
         with right:
             focus = detail.nsmallest(15, "销售额变动").copy()
             focus["分析对象"] = focus[dimension].astype(str) + " · " + focus["spu"].astype(str)
-            st.plotly_chart(
+            render_switchable_chart(
                 structure_bar_figure(
                     focus,
                     "分析对象",
@@ -1567,8 +1807,7 @@ def product_structure_health_section(
                     "amount",
                     COLORS["gold"],
                 ),
-                width="stretch",
-                config={"displayModeBar": False},
+                f"health_decline_focus_{dimension}",
             )
         summary_columns = [
             dimension,
@@ -1626,7 +1865,7 @@ def product_structure_health_section(
     st.caption("候选范围为所有本期分级的存量SPU，要求销售额与毛利额-1均实现正增长；Top排序将销售额和毛利额-1的绝对增量排名等权合并。")
     left, right = st.columns(2)
     with left:
-        st.plotly_chart(
+        render_switchable_chart(
             structure_bar_figure(
                 summary,
                 dimension,
@@ -1636,13 +1875,15 @@ def product_structure_health_section(
                 "amount",
                 COLORS["blue"],
             ),
-            width="stretch",
-            config={"displayModeBar": False},
+            f"health_improve_contribution_{dimension}",
+            pie_data=summary,
+            pie_label=dimension,
+            pie_value="Top销售额增长",
         )
     with right:
         top_chart = top.copy()
         top_chart["分析对象"] = top_chart[dimension].astype(str) + " · " + top_chart["spu"].astype(str)
-        st.plotly_chart(
+        render_switchable_chart(
             structure_bar_figure(
                 top_chart,
                 "分析对象",
@@ -1652,8 +1893,10 @@ def product_structure_health_section(
                 "amount",
                 COLORS["gold"],
             ),
-            width="stretch",
-            config={"displayModeBar": False},
+            f"health_improve_top_{dimension}",
+            pie_data=top_chart,
+            pie_label="分析对象",
+            pie_value="销售额变动",
         )
     summary_columns = [
         dimension,
@@ -1727,14 +1970,16 @@ def category_grade_page(
     st.caption("有效SPU数仅统计当前筛选期间销售额大于 0 的 SPU，与“SPU 诊断”的子类目样本数保持一致；零销售 SPU 不计入该数量。")
     left, right = st.columns(2)
     with left:
-        st.plotly_chart(
+        render_switchable_chart(
             bar_figure(view.head(20), dimension, "sales_amount", f"各{selected_level}销售额", horizontal=dimension != "grade"),
-            width="stretch",
-            config={"displayModeBar": False},
+            f"category_sales_{dimension}",
+            pie_data=view,
+            pie_label=dimension,
+            pie_value="sales_amount",
         )
     with right:
         margin_view = view.loc[view["sales_amount"] > 0].head(20)
-        st.plotly_chart(
+        render_switchable_chart(
             bar_figure(
                 margin_view,
                 dimension,
@@ -1743,8 +1988,7 @@ def category_grade_page(
                 COLORS["gold"],
                 horizontal=dimension != "grade",
             ),
-            width="stretch",
-            config={"displayModeBar": False},
+            f"category_margin_{dimension}",
         )
 
     table_columns = [
@@ -1800,10 +2044,12 @@ def category_grade_page(
         )
         share_chart = style_figure(share_chart, height=max(360, min(620, 44 * len(share_view))))
         share_chart.update_layout(margin={"l": 14, "r": 82, "t": 50, "b": 24})
-        st.plotly_chart(
+        render_switchable_chart(
             share_chart,
-            width="stretch",
-            config={"displayModeBar": False},
+            f"category_share_{dimension}",
+            pie_data=view,
+            pie_label=dimension,
+            pie_value="sales_amount",
         )
         share_table = share_view[[dimension, "sales_amount", "类目销售占比"]].sort_values(
             "sales_amount", ascending=False
@@ -1891,7 +2137,7 @@ def category_grade_page(
         show_legend=True,
     )
     fig.update_layout(margin={"l": 18, "r": 86, "t": 62, "b": 28})
-    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    render_switchable_chart(fig, f"category_grade_cross_{cross_dimension}")
     cross_columns = [
         cross_dimension,
         "grade",
@@ -1928,7 +2174,7 @@ def definitions_page(data: pd.DataFrame) -> None:
         <b>仓储成本：</b>取原表“海外仓仓储费用”，沿用成本符号口径（源值为负时转为正成本）；正数冲减值保留为负成本。<br>
         <b>核心费用：</b>采购成本、头程费用、海外仓尾程费用及调整、仓储成本、退款费用、广告费用、库存折损。费用率分母均为销售额合计。<br>
         <b>品效：</b>有效SPU数为当前筛选范围内销售额大于 0 的去重SPU数；品效-销售额=总销售额/有效SPU数，品效-毛利额=毛利额-1/有效SPU数。<br>
-        <b>SPU贡献占比：</b>销售额占总销售额占比=SPU销售额/当前筛选范围总销售额；毛利额-1占总销售额占比=SPU毛利额-1/当前筛选范围总销售额，用于衡量单品对整体毛利率的贡献。<br>
+        <b>SPU贡献占比：</b>销售额占总销售额占比=SPU销售额/当前筛选范围全部SPU销售额合计；毛利额-1占总毛利额占比=SPU毛利额-1/同一范围全部SPU毛利额-1合计。两列分别独立合计为100%；亏损SPU的毛利占比可为负，某些盈利SPU因而可能超过100%；总额为零时不计算对应占比。<br>
         <b>同期对比：</b>选择 2026 年并开启“同时显示 2025 同期”后，对比数据会直接进入经营总览、自由分析、SPU诊断和产品分级&类目。<br>
         <b>月度与环比：</b>自由分析“月度”模式按自然月展示所选期间固定 TOP N；金额指标环比以百分比展示，成本占比及毛利率环比以 pp 展示；上月无数据时留空。<br>
         <b>中位数：</b>按平台独立计算；子类目中位数按“平台 × 大类目 × 子类目”，平台全品类中位数按“平台”；中位数样本仅使用销售额大于 0 的 SPU。<br>

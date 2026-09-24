@@ -7,6 +7,7 @@ last calculated values; the BI never depends on workbook external links.
 from __future__ import annotations
 
 import os
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Iterable, Mapping, Sequence
@@ -142,6 +143,46 @@ def _numeric(series: pd.Series) -> pd.Series:
 Source = str | Path | bytes | BinaryIO
 
 
+def _2026_profit_positions(headers: pd.DataFrame, display_name: str) -> dict[str, int]:
+    """Recognize the two supported tails from labels, not workbook width.
+
+    H1: BV profit 1, BW margin 1, BX inventory loss, BY profit 2.
+    Jan-Aug: BV profit 1 (mislabeled profit 2), BW inventory loss, BX profit 2.
+    The optional final margin column is not imported: rates are calculated below.
+    """
+    def label(position: int) -> str:
+        if position >= headers.shape[1]:
+            return ""
+        # Vertically merged tail labels live in row 1; unmerged labels may be
+        # in row 2. Prefer the more specific lower header when it is populated.
+        for value in reversed(headers.iloc[:, position].tolist()):
+            if pd.notna(value) and str(value).strip():
+                return re.sub(r"[\s\-－—–]+", "", str(value))
+        return ""
+
+    if headers.shape[1] < 76:
+        raise ValueError(f"{display_name} 字段列数不足：2026 年模板至少需要 76 列")
+    tail = [label(position) for position in range(73, 77)]
+    if tail[0] in {"毛利润1", "毛利润2"}:
+        if tail[1:3] == ["库存损失", "毛利润2"]:
+            return {
+                "gross_profit_1_raw": 73,
+                "inventory_loss_raw": 74,
+                "gross_profit_2_source_raw": 75,
+            }
+        if tail[1:] == ["毛利率1", "库存损失", "毛利润2"]:
+            return {
+                "gross_profit_1_raw": 73,
+                "inventory_loss_raw": 75,
+                "gross_profit_2_source_raw": 76,
+            }
+    raise ValueError(
+        f"{display_name} 无法识别 2026 年毛利/库存损失列结构："
+        f"BV–BY 表头为 {tail}。支持 H1 含毛利率列结构，或 1–8 月不含毛利率列结构；"
+        "请检查表头与列顺序，不要仅在末尾补空列。"
+    )
+
+
 def _read_source(source: Source, year: int, source_name: str | None = None) -> pd.DataFrame:
     """Read cached workbook values and select the columns used by the dashboard."""
     if isinstance(source, (str, Path)):
@@ -158,7 +199,9 @@ def _read_source(source: Source, year: int, source_name: str | None = None) -> p
         excel_source = source
         display_name = source_name or Path(getattr(source, "name", f"{year}年度上传文件.xlsx")).name
 
-    raw = pd.read_excel(excel_source, sheet_name=0, header=1, engine="openpyxl")
+    with pd.ExcelFile(excel_source, engine="openpyxl") as workbook:
+        headers = pd.read_excel(workbook, sheet_name=0, header=None, nrows=2)
+        raw = pd.read_excel(workbook, sheet_name=0, header=1)
     if raw.empty or raw.shape[1] == 0:
         raise ValueError(f"{display_name} 没有可读取的数据")
     month_number = pd.to_numeric(raw.iloc[:, 0], errors="coerce")
@@ -167,8 +210,8 @@ def _read_source(source: Source, year: int, source_name: str | None = None) -> p
     if data.empty:
         raise ValueError(f"{display_name} 未找到 {year} 年月份明细，请检查上传年度与表头结构")
 
-    # The 2026 source inserted SKU after MSKU and has two margin columns near
-    # the end.  SKU/MSKU are deliberately not surfaced in the dashboard.
+    # The 2026 source inserted SKU after MSKU. Its tail has variants with and
+    # without margin columns. SKU/MSKU are not surfaced in the dashboard.
     if year == 2025:
         positions = {
             "spu": 2,
@@ -213,9 +256,7 @@ def _read_source(source: Source, year: int, source_name: str | None = None) -> p
             "storage_cost_raw": 44,  # 海外仓仓储费用
             "refund_raw": 19,
             "ad_raw": 24,
-            "gross_profit_1_raw": 73,  # BV
-            "inventory_loss_raw": 75,  # BX
-            "gross_profit_2_source_raw": 76,  # BY: retained only for audit
+            **_2026_profit_positions(headers, display_name),
         }
 
     required_width = max(positions.values()) + 1
@@ -1002,11 +1043,13 @@ def build_spu_benchmarks(selected_frame: pd.DataFrame, population_frame: pd.Data
     detail_dimensions = ["platform", "category", "subcategory", "grade", "spu"]
     selected = aggregate_pnl(selected_frame, detail_dimensions)
     total_sales = selected["sales_amount"].sum()
-    denominator = total_sales if total_sales != 0 else pd.NA
-    selected["sales_share_of_total_sales"] = selected["sales_amount"].div(denominator)
-    selected["gross_profit_share_of_total_sales"] = selected[
+    total_profit = selected["standard_gross_profit_1"].sum()
+    selected["sales_share_of_total_sales"] = selected["sales_amount"].div(
+        total_sales if total_sales != 0 else float("nan")
+    )
+    selected["gross_profit_share_of_total_profit"] = selected[
         "standard_gross_profit_1"
-    ].div(denominator)
+    ].div(total_profit if total_profit != 0 else float("nan"))
     population = aggregate_pnl(population_frame, detail_dimensions)
     population = population.loc[population["sales_amount"] > 0].copy()
 
